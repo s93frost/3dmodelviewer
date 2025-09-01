@@ -1,18 +1,25 @@
-from PyQt5.QtWidgets import QMainWindow, QFileDialog, QAction # Basic PyQt5 imports
-# Additional PyQt5 widgets
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton, QColorDialog, QSpinBox
-from PyQt5.QtCore import Qt # For Qt constants
-from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
-import vtkmodules.qt # Ensure VTK Qt support is loaded
-vtkmodules.qt.QVTKRWIBase = 'QGLWidget' # Ensure using QGLWidget
-import vtk # VTK core
+'''3D Model Viewer Application using PyQt5 and VTK'''
+
+# Standard library imports
 import os # For file path operations
 import math # For mathematical operations
+import tempfile  # For creating temporary files
+
+# Third-party imports
+import vtk # VTK core
 import laspy # For LAS loading
 import numpy as np # For numerical operations
 import pye57 # For E57 loading
 import trimesh # For alternative OBJ loading
-import tempfile  # For creating temporary files
+
+from PyQt5.QtCore import Qt # For Qt constants
+from PyQt5.QtWidgets import QMainWindow, QFileDialog, QAction, QInputDialog, QListWidget, QDockWidget, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton, QColorDialog, QSpinBox, QWidget  # Basic PyQt5 imports
+# from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton, QColorDialog, QSpinBox
+
+from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
+import vtkmodules.qt # Ensure VTK Qt support is loaded
+vtkmodules.qt.QVTKRWIBase = 'QGLWidget' # Ensure using QGLWidget
+
 
 
 def create_outline_actor(polydata):
@@ -28,16 +35,32 @@ def create_outline_actor(polydata):
 
 
 def load_las_as_vtk(filename):
-    ''' Load LAS file and convert to VTK PolyData '''
-    las = laspy.read(filename)
+    '''Load LAS file and convert to VTK PolyData'''
+    if not isinstance(filename, str) or not os.path.isfile(filename):
+        raise ValueError(f"Invalid filename: {filename}")
+
+    try:
+        las = laspy.read(filename)
+    except Exception as e:
+        print(f"Error reading LAS file: {e}")
+        return vtk.vtkPolyData()  # Return empty polydata on error
+
+    if not hasattr(las, 'x') or not hasattr(las, 'y') or not hasattr(las, 'z'):
+        print("LAS file missing coordinate data.")
+        return vtk.vtkPolyData()
+
     points = np.vstack((las.x, las.y, las.z)).transpose()
 
     # Optional: color support if available
-    has_color = hasattr(las, 'red') and hasattr(las, 'green') and hasattr(las, 'blue')
+    has_color = all(hasattr(las, attr) for attr in ['red', 'green', 'blue'])
     colors = None
-    if has_color:
-        colors = np.vstack((las.red, las.green, las.blue)).transpose()
-        colors = (colors / 65535.0 * 255).astype(np.uint8)  # Normalize to 0–255
+    if has_color and las.red is not None and las.green is not None and las.blue is not None:
+        try:
+            colors = np.vstack((las.red, las.green, las.blue)).transpose()
+            colors = (colors / 65535.0 * 255).astype(np.uint8)  # Normalize to 0–255
+        except Exception as e:
+            print(f"Error processing color data: {e}")
+            colors = None
 
     # Convert to VTK points
     vtk_points = vtk.vtkPoints()
@@ -47,13 +70,15 @@ def load_las_as_vtk(filename):
     polydata = vtk.vtkPolyData()
     polydata.SetPoints(vtk_points)
 
-    if has_color:
+    if colors is not None:
         vtk_colors = vtk.vtkUnsignedCharArray()
         vtk_colors.SetNumberOfComponents(3)
         vtk_colors.SetName("Colors")
         for c in colors:
             vtk_colors.InsertNextTuple3(*c)
         polydata.GetPointData().SetScalars(vtk_colors)
+    else:
+        print("No color data found or processed for LAS file.")
 
     return polydata
 
@@ -91,16 +116,24 @@ class CustomQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
         super().__init__(parent)
         self.parent = parent
 
-    def keyPressEvent(self, event):
-        """Handle arrow key presses to rotate the model."""
-        if self.parent.dialog_active:
-            return  # Ignore key events if a dialog is active
-
+    def wheelEvent(self, event):
         camera = self.parent.renderer.GetActiveCamera()
+        # Swap zoom factors so scrolling up zooms in, down zooms out
+        zoom_factor = 1.1 if event.angleDelta().y() > 0 else 0.9
+        camera.Dolly(zoom_factor)
+        self.parent.renderer.ResetCameraClippingRange()
+        self.parent.vtk_widget.GetRenderWindow().Render()
 
-        # Rotation step size (in degrees)
+    def keyPressEvent(self, event):
+        if self.parent.dialog_active:
+            return
+        # Forward B key to parent for background toggle
+        if event.key() == Qt.Key_B:
+            self.parent.toggle_background()
+            return
+        # Existing camera rotation logic
+        camera = self.parent.renderer.GetActiveCamera()
         rotation_step = 5
-
         if event.key() == Qt.Key_Left:
             camera.Azimuth(rotation_step)
         elif event.key() == Qt.Key_Right:
@@ -109,10 +142,17 @@ class CustomQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
             camera.Elevation(-rotation_step)
         elif event.key() == Qt.Key_Down:
             camera.Elevation(rotation_step)
-
-        # Update the camera view
         camera.OrthogonalizeViewUp()
         self.parent.vtk_widget.GetRenderWindow().Render()
+
+        if event.key() == Qt.Key_Plus or event.key() == Qt.Key_Equal:
+            camera.Dolly(1.1)  # Zoom out
+            self.parent.renderer.ResetCameraClippingRange()
+            self.parent.vtk_widget.GetRenderWindow().Render()
+        elif event.key() == Qt.Key_Minus or event.key() == Qt.Key_Underscore:
+            camera.Dolly(0.9)  # Zoom in
+            self.parent.renderer.ResetCameraClippingRange()
+            self.parent.vtk_widget.GetRenderWindow().Render()
 
     def mousePressEvent(self, event):
         """Handle mouse press events."""
@@ -226,12 +266,63 @@ class ViewerApp(QMainWindow):
         self.dialog_active = False  # Flag to track if a dialog is open
         self.setWindowTitle("3D Model Viewer")
         self.setGeometry(100, 100, 800, 600) # Set initial window size
-        self.current_lighting_preset = "default"
-        self.measure_points = [] # Store measurement points
-        self.annotations = []  # Store annotation actors
+        self.current_lighting_preset = "studio"
+        self.measure_points = []  # Store measurement points
+        self.measure_markers = [] # Store marker actors for measurements
+        self.measure_lines = []   # Store line actors for measurements
+        self.annotations = []     # Store annotation actors
         # VTK widget
         self.vtk_widget = CustomQVTKRenderWindowInteractor(self)
         self.setCentralWidget(self.vtk_widget)
+        # Measurement history and undo/redo stacks
+        self.measure_history = []
+        self.undo_stack = []
+        self.redo_stack = []
+
+        self.history_list = QListWidget()
+
+        # Create a widget to hold controls and history list
+        history_widget = QWidget()
+        history_layout = QVBoxLayout(history_widget)
+        # Measurement control buttons
+        btn_start = QPushButton("Start Measuring")
+        btn_start.clicked.connect(self.activate_measure_mode)
+        history_layout.addWidget(btn_start)
+        btn_stop = QPushButton("Stop Measuring")
+        btn_stop.clicked.connect(self.cancel_measurement)
+        history_layout.addWidget(btn_stop)
+        btn_clear_last = QPushButton("Clear Last Measurement")
+        btn_clear_last.clicked.connect(self.clear_last_measurement)
+        history_layout.addWidget(btn_clear_last)
+        btn_clear_all = QPushButton("Clear All Measurements")
+        btn_clear_all.clicked.connect(self.clear_all_measurements)
+        history_layout.addWidget(btn_clear_all)
+        btn_delete_selected = QPushButton("Delete Selected Measurement")
+        btn_delete_selected.clicked.connect(self.delete_selected_measurement)
+        history_layout.addWidget(btn_delete_selected)
+        # Undo/Redo buttons
+        btn_undo = QPushButton("Undo")
+        btn_undo.clicked.connect(self.undo_measurement)
+        history_layout.addWidget(btn_undo)
+        btn_redo = QPushButton("Redo")
+        btn_redo.clicked.connect(self.redo_measurement)
+        history_layout.addWidget(btn_redo)
+        # Add the history list below the controls
+        history_layout.addWidget(self.history_list)
+
+        self.history_dock = QDockWidget("Measurements", self)
+        self.history_dock.setWidget(history_widget)
+        self.history_dock.setFeatures(QDockWidget.DockWidgetMovable)  # Only allow moving, not closing or floating
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.history_dock)
+
+        self.background_colors = [
+            (1, 1, 1),        # White
+            (0.9, 0.9, 0.9),  # Light Gray
+            (0.2, 0.2, 0.2),  # Dark Gray
+            (0, 0, 0)         # Black
+        ]
+        self.background_index = 2  # Start with dark gray
+
         # Renderer
         self.renderer = vtk.vtkRenderer()
         self.vtk_widget.GetRenderWindow().AddRenderer(self.renderer)
@@ -267,9 +358,18 @@ class ViewerApp(QMainWindow):
         view_menu = menubar.addMenu("View")
         # Reset view action
         reset_view_action = QAction("Reset View", self)
-        reset_view_action.setShortcut("R")  # Optional shortcut
+        reset_view_action.setShortcut("R")
         reset_view_action.triggered.connect(self.reset_view)
         view_menu.addAction(reset_view_action)
+        # Add zoom in/out actions
+        zoom_in_action = QAction("Zoom In", self)
+        zoom_in_action.setShortcut("Ctrl++")
+        zoom_in_action.triggered.connect(lambda: self.zoom_camera(0.9))
+        view_menu.addAction(zoom_in_action)
+        zoom_out_action = QAction("Zoom Out", self)
+        zoom_out_action.setShortcut("Ctrl+-")
+        zoom_out_action.triggered.connect(lambda: self.zoom_camera(1.1))
+        view_menu.addAction(zoom_out_action)
 
         ########### WIREFRAME MENU ##############
         wireframe_menu = menubar.addMenu("Wireframe")
@@ -280,18 +380,32 @@ class ViewerApp(QMainWindow):
 
         ########### MEASURE MENU ##############
         measure_menu = menubar.addMenu("Measure")
-        # MEASURE DISTANCE ACTION
-        measure_action = QAction("Measure Distance", self)
-        measure_action.triggered.connect(self.activate_measure_mode)
-        measure_menu.addAction(measure_action)
+        # START MEASURING ACTION
+        start_measure_action = QAction("Start Measuring", self)
+        start_measure_action.triggered.connect(self.activate_measure_mode)
+        measure_menu.addAction(start_measure_action)
+        # STOP MEASURING ACTION
+        stop_measure_action = QAction("Stop Measuring", self)
+        stop_measure_action.triggered.connect(self.cancel_measurement)
+        measure_menu.addAction(stop_measure_action)
         # CLEAR LAST MEASUREMENT ACTION
         clear_last_measure_action = QAction("Clear Last Measurement", self)
         clear_last_measure_action.triggered.connect(self.clear_last_measurement)
         measure_menu.addAction(clear_last_measure_action)
-        #  CLEAR All MEASUREMENTS ACTION
+        # CLEAR ALL MEASUREMENTS ACTION
         clear_measure_action = QAction("Clear All Measurements", self)
         clear_measure_action.triggered.connect(self.clear_all_measurements)
         measure_menu.addAction(clear_measure_action)
+        # UNDO MEASUREMENT ACTION
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut("Ctrl+Z")
+        undo_action.triggered.connect(self.undo_measurement)
+        measure_menu.addAction(undo_action)
+        # REDO MEASUREMENT ACTION
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut("Ctrl+Y")
+        redo_action.triggered.connect(self.redo_measurement)
+        measure_menu.addAction(redo_action)
 
         ########### ANNOTATION MENU ##############
         annotation_menu = menubar.addMenu("Annotation")
@@ -315,18 +429,19 @@ class ViewerApp(QMainWindow):
         cycle_lighting.triggered.connect(self.cycle_lighting_preset)
         lighting_menu.addAction(cycle_lighting)
         # specific lighting presets
-        # default lighting
         lighting_default = QAction("Lighting: Default", self)
         lighting_default.triggered.connect(lambda: self.apply_lighting_preset("default"))
         lighting_menu.addAction(lighting_default)
-        # studio lighting
         lighting_studio = QAction("Lighting: Studio", self)
         lighting_studio.triggered.connect(lambda: self.apply_lighting_preset("studio"))
         lighting_menu.addAction(lighting_studio)
-        # lighting off
         lighting_off = QAction("Lighting: Off", self)
         lighting_off.triggered.connect(lambda: self.apply_lighting_preset("off"))
         lighting_menu.addAction(lighting_off)
+        # Add another option: "Lighting: Warm"
+        lighting_warm = QAction("Lighting: Warm", self)
+        lighting_warm.triggered.connect(lambda: self.apply_lighting_preset("warm"))
+        lighting_menu.addAction(lighting_warm)
         # light adjustment dialog
         adjust_lights = QAction("Custom Adjust Lights", self)
         adjust_lights.triggered.connect(self.open_light_dialog)
@@ -335,21 +450,32 @@ class ViewerApp(QMainWindow):
         ############# BACKGROUND COLOR MENU ################
         background_menu = menubar.addMenu("Background")
         bg_white = QAction("White", self)
+        bg_white.setShortcut("Ctrl+1")
         bg_white.triggered.connect(lambda: self.set_background_color(1, 1, 1))
         background_menu.addAction(bg_white)
         bg_light_gray = QAction("Light Gray", self)
+        bg_light_gray.setShortcut("Ctrl+2")
         bg_light_gray.triggered.connect(lambda: self.set_background_color(0.9, 0.9, 0.9))
         background_menu.addAction(bg_light_gray)
         bg_dark_gray = QAction("Dark Gray", self)
+        bg_dark_gray.setShortcut("Ctrl+3")
         bg_dark_gray.triggered.connect(lambda: self.set_background_color(0.2, 0.2, 0.2))
         background_menu.addAction(bg_dark_gray)
         bg_black = QAction("Black", self)
+        bg_black.setShortcut("Ctrl+4")
         bg_black.triggered.connect(lambda: self.set_background_color(0, 0, 0))
         background_menu.addAction(bg_black)
         # Optionally, add a custom color picker
         bg_custom = QAction("Custom...", self)
+        bg_custom.setShortcut("Ctrl+5")
         bg_custom.triggered.connect(self.pick_custom_background)
         background_menu.addAction(bg_custom)
+        # Add cycle background option
+        bg_cycle = QAction("Cycle Background", self)
+        bg_cycle.setShortcut("B")
+        bg_cycle.triggered.connect(self.toggle_background)
+        background_menu.addAction(bg_cycle)
+
 
     def save_polydata(self, filename, writer_class, polydata):
         '''Save the given polydata to a file using the specified writer class.'''
@@ -420,6 +546,13 @@ class ViewerApp(QMainWindow):
         self.renderer.SetUseDepthPeeling(1)
         self.renderer.SetMaximumNumberOfPeels(100)  # Maximum number of depth peels
         self.renderer.SetOcclusionRatio(0.1)  # Occlusion ratio (lower is better quality)
+
+    def zoom_camera(self, factor):
+        '''Zoom the camera in or out by a given factor.'''
+        camera = self.renderer.GetActiveCamera()
+        camera.Dolly(factor)
+        self.renderer.ResetCameraClippingRange()
+        self.vtk_widget.GetRenderWindow().Render()
 
     def reset_view(self):
         """Reset the camera to its default position."""
@@ -503,7 +636,7 @@ class ViewerApp(QMainWindow):
             polydata.GetPointData().SetScalars(colors)
 
         return polydata
-    
+
     def load_point_cloud(self, filename, loader_function):
         '''Load a point cloud file using the specified loader function.'''
         polydata = loader_function(filename)
@@ -515,7 +648,7 @@ class ViewerApp(QMainWindow):
         self.renderer.AddActor(outline_actor)
         actor.GetProperty().SetPointSize(2)
         self.renderer.AddActor(actor)
-    
+
     def deactivate_all_modes(self):
         '''Deactivate all active modes.'''
         if hasattr(self, "left_click_observer"):
@@ -528,10 +661,34 @@ class ViewerApp(QMainWindow):
             self.vtk_widget.RemoveObserver(self.annotation_observer)
             del self.annotation_observer
 
+    def keyPressEvent(self, event):
+        """Forward key press events to the VTK widget's handler."""
+        self.vtk_widget.keyPressEvent(event)
+
+        # Rotation step size (in degrees)
+        rotation_step = 5
+
+        camera = self.renderer.GetActiveCamera()
+
+        if event.key() == Qt.Key_Left:
+            camera.Azimuth(rotation_step)
+        elif event.key() == Qt.Key_Right:
+            camera.Azimuth(-rotation_step)
+        elif event.key() == Qt.Key_Up:
+            camera.Elevation(-rotation_step)
+        elif event.key() == Qt.Key_Down:
+            camera.Elevation(rotation_step)
+
+        # Update the camera view
+        camera.OrthogonalizeViewUp()
+        self.vtk_widget.GetRenderWindow().Render()
+
+
+    ############### MEASUREMENT METHODS #################
+
     def activate_measure_mode(self):
         '''Activate measurement mode to measure distances.'''
         self.deactivate_all_modes()  # Ensure no other mode is active
-
         # Remove previous observers if they exist
         if hasattr(self, "left_click_observer"):
             self.vtk_widget.RemoveObserver(self.left_click_observer)
@@ -539,14 +696,23 @@ class ViewerApp(QMainWindow):
         if hasattr(self, "right_click_observer"):
             self.vtk_widget.RemoveObserver(self.right_click_observer)
             del self.right_click_observer
-
-        # Add new observers
-        self.measure_points = []
-        self.measure_lines = []
-        self.measure_markers = []
+        # Do NOT reset the lists here!
         self.statusBar().showMessage("Click points to measure. Right-click to finish.")
         self.left_click_observer = self.vtk_widget.AddObserver("LeftButtonPressEvent", self.on_measure_click)
         self.right_click_observer = self.vtk_widget.AddObserver("RightButtonPressEvent", self.finish_measure)
+
+    def cancel_measurement(self):
+        '''Cancel the current measurement mode, but keep visuals.'''
+        if hasattr(self, "left_click_observer"):
+            self.vtk_widget.RemoveObserver(self.left_click_observer)
+            del self.left_click_observer
+        if hasattr(self, "right_click_observer"):
+            self.vtk_widget.RemoveObserver(self.right_click_observer)
+            del self.right_click_observer
+        # Do NOT remove marker/line actors or clear lists here!
+        # Only clear temporary measurement points if needed:
+        self.measure_points.clear()
+        self.statusBar().showMessage("Measurement cancelled.")
 
     def on_measure_click(self, obj, event):
         '''Handle click to add measurement point.'''
@@ -577,6 +743,9 @@ class ViewerApp(QMainWindow):
                 p1 = self.measure_points[-2]
                 p2 = self.measure_points[-1]
                 dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
+                self.measure_history.append(dist)
+                self.undo_stack.append(('add', dist))
+                self.history_list.addItem(f"Segment {n-1}: {dist:.3f}")
                 self.statusBar().showMessage(f"Last segment: {dist:.3f} | Total: {self.measure_total():.3f}")
                 # Draw line
                 line = vtk.vtkLineSource()
@@ -592,11 +761,14 @@ class ViewerApp(QMainWindow):
                 self.renderer.AddActor(actor)
                 self.measure_lines.append(actor)
                 self.vtk_widget.GetRenderWindow().Render()
-        
+
     def finish_measure(self, obj, event):
         '''Finish measurement mode.'''
         if len(self.measure_points) > 1:
             total = self.measure_total()
+            self.history_list.addItem(f"Total: {total:.3f}")
+            self.measure_history.append(total)
+            self.undo_stack.append(('add', total))
             self.statusBar().showMessage(f"Measurement finished. Total path length: {total:.3f}")
         else:
             self.statusBar().showMessage("Measurement cancelled or not enough points.")
@@ -613,22 +785,27 @@ class ViewerApp(QMainWindow):
             p2 = self.measure_points[i]
             total += math.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
         return total
-    
+
     def clear_all_measurements(self):
         '''Clear all measurements.'''
         # Remove marker actors
         if hasattr(self, "measure_markers"):
-            for actor in self.measure_markers:
+            for actor in list(self.measure_markers):
                 self.renderer.RemoveActor(actor)
             self.measure_markers.clear()
         # Remove line actors
         if hasattr(self, "measure_lines"):
-            for actor in self.measure_lines:
+            for actor in list(self.measure_lines):
                 self.renderer.RemoveActor(actor)
             self.measure_lines.clear()
         # Clear points
         if hasattr(self, "measure_points"):
             self.measure_points.clear()
+        # Clear measurement history and undo/redo stacks
+        self.measure_history.clear()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.history_list.clear()
         self.vtk_widget.GetRenderWindow().Render()
         self.statusBar().showMessage("All measurements cleared.")
 
@@ -645,8 +822,107 @@ class ViewerApp(QMainWindow):
         # Remove last point
         if hasattr(self, "measure_points") and self.measure_points:
             self.measure_points.pop()
+        # Remove last measurement from history and history list
+        if self.measure_history:
+            self.measure_history.pop()
+        if self.history_list.count() > 0:
+            self.history_list.takeItem(self.history_list.count() - 1)
         self.vtk_widget.GetRenderWindow().Render()
         self.statusBar().showMessage("Last measurement cleared.")
+
+    def delete_selected_measurement(self):
+        '''Delete the selected measurement from history and scene.'''
+        selected_items = self.history_list.selectedItems()
+        if not selected_items:
+            self.statusBar().showMessage("No measurement selected.")
+            return
+
+        # Collect rows to delete, sort in reverse so indices don't shift
+        rows = sorted([self.history_list.row(item) for item in selected_items], reverse=True)
+        for row in rows:
+            self.history_list.takeItem(row)
+            # Remove from measure_history
+            if row < len(self.measure_history):
+                del self.measure_history[row]
+            # Remove corresponding line actor
+            if row < len(self.measure_lines):
+                actor = self.measure_lines[row]
+                self.renderer.RemoveActor(actor)
+                del self.measure_lines[row]
+            # Remove corresponding markers
+            # Remove marker at segment end
+            if row + 1 < len(self.measure_markers):
+                actor = self.measure_markers[row + 1]
+                self.renderer.RemoveActor(actor)
+                del self.measure_markers[row + 1]
+            # Remove marker at segment start only if it's not shared with previous segment
+            if row < len(self.measure_markers):
+                actor = self.measure_markers[row]
+                self.renderer.RemoveActor(actor)
+                del self.measure_markers[row]
+            # Remove corresponding points
+            if row + 1 < len(self.measure_points):
+                del self.measure_points[row + 1]
+            if row < len(self.measure_points):
+                del self.measure_points[row]
+        self.vtk_widget.GetRenderWindow().Render()
+        self.statusBar().showMessage("Selected measurement(s) deleted.")
+
+        # Collect rows to delete, sort in reverse so indices don't shift
+        rows = sorted([self.history_list.row(item) for item in selected_items], reverse=True)
+        for row in rows:
+            self.history_list.takeItem(row)
+            # Remove from measure_history
+            if row < len(self.measure_history):
+                del self.measure_history[row]
+            # Remove corresponding line actor
+            if row < len(self.measure_lines):
+                actor = self.measure_lines[row]
+                self.renderer.RemoveActor(actor)
+                del self.measure_lines[row]
+            # Remove corresponding markers
+            # Remove marker at segment end
+            if row + 1 < len(self.measure_markers):
+                actor = self.measure_markers[row + 1]
+                self.renderer.RemoveActor(actor)
+                del self.measure_markers[row + 1]
+            # Remove marker at segment start only if it's not shared with previous segment
+            if row < len(self.measure_markers):
+                actor = self.measure_markers[row]
+                self.renderer.RemoveActor(actor)
+                del self.measure_markers[row]
+            # Remove corresponding points
+            if row + 1 < len(self.measure_points):
+                del self.measure_points[row + 1]
+            if row < len(self.measure_points):
+                del self.measure_points[row]
+        self.vtk_widget.GetRenderWindow().Render()
+        self.statusBar().showMessage("Selected measurement(s) deleted.")
+
+    def undo_measurement(self):
+        '''Undo the last measurement.'''
+        if self.undo_stack:
+            action, value = self.undo_stack.pop()
+            if action == 'add' and self.measure_history:
+                removed = self.measure_history.pop()
+                self.redo_stack.append(('add', removed))
+                self.history_list.takeItem(self.history_list.count() - 1)
+                self.statusBar().showMessage("Undo last measurement.")
+            # Optionally, remove last marker/line actor here
+
+    def redo_measurement(self):
+        '''Redo the last undone measurement.'''
+        if self.redo_stack:
+            action, value = self.redo_stack.pop()
+            if action == 'add':
+                self.measure_history.append(value)
+                self.undo_stack.append(('add', value))
+                self.history_list.addItem(f"Redo: {value:.3f}")
+                self.statusBar().showMessage("Redo last measurement.")
+            # Optionally, restore marker/line actor here
+
+
+    ############### ANNOTATION METHODS #################
 
     def activate_annotation_mode(self):
         '''Activate annotation mode to add text annotations.'''
@@ -663,7 +939,6 @@ class ViewerApp(QMainWindow):
         picker.Pick(click_pos[0], click_pos[1], 0, self.renderer)
         pos = picker.GetPickPosition()
         if pos != (0.0, 0.0, 0.0):
-            from PyQt5.QtWidgets import QInputDialog
             print("Opening annotation dialog...")
             self.dialog_active = True  # Disable key and mouse events
             print(f"dialog_active set to {self.dialog_active}")
@@ -703,35 +978,25 @@ class ViewerApp(QMainWindow):
         else:
             self.statusBar().showMessage("No annotations to clear.")
 
-    def keyPressEvent(self, event):
-        """Handle arrow key presses to rotate the model."""
-        camera = self.renderer.GetActiveCamera()
 
-        # Rotation step size (in degrees)
-        rotation_step = 5
+    ###############  BACKGROUND METHODS #################
 
-        if event.key() == Qt.Key_Left:
-            # Rotate left (around the Y-axis)
-            camera.Azimuth(rotation_step)
-        elif event.key() == Qt.Key_Right:
-            # Rotate right (around the Y-axis)
-            camera.Azimuth(-rotation_step)
-        elif event.key() == Qt.Key_Up:
-            # Rotate up (around the X-axis)
-            camera.Elevation(-rotation_step)
-        elif event.key() == Qt.Key_Down:
-            # Rotate down (around the X-axis)
-            camera.Elevation(rotation_step)
-
-        # Update the camera view
-        camera.OrthogonalizeViewUp()
-        self.vtk_widget.GetRenderWindow().Render()
+    def toggle_background(self):
+        '''Cycle background color between white, light gray, dark gray, and black.'''
+        self.background_index = (self.background_index + 1) % len(self.background_colors)
+        color = self.background_colors[self.background_index]
+        self.set_background_color(*color)
 
     def set_background_color(self, r, g, b):
         '''Set the background color of the renderer.'''
         self.renderer.SetBackground(r, g, b)
+        # Update index to match the color if it's in the list
+        for i, col in enumerate(self.background_colors):
+            if all(abs(c1 - c2) < 0.01 for c1, c2 in zip(col, (r, g, b))):
+                self.background_index = i
+                break
         self.vtk_widget.GetRenderWindow().Render()
-        self.statusBar().showMessage(f"Background color set.")
+        self.statusBar().showMessage("Background color set.")
 
     def pick_custom_background(self):
         '''Open a color picker dialog to select a custom background color.'''
@@ -740,6 +1005,9 @@ class ViewerApp(QMainWindow):
             rgb = color.getRgbF()[:3]
             self.set_background_color(*rgb)
 
+
+    ############### LIGHTING METHODS #################
+
     def open_light_dialog(self):
         '''Open a dialog to adjust light properties.'''
         if hasattr(self, "lights") and self.lights:
@@ -747,17 +1015,16 @@ class ViewerApp(QMainWindow):
             dlg.exec_()
         else:
             self.statusBar().showMessage("No lights to adjust in this preset.")
-    
-    ############### LIGHTING METHODS #################
+
     def cycle_lighting_preset(self):
         '''Cycle through predefined lighting presets.'''
-        presets = ["default", "studio", "off"]
+        presets = ["studio", "default", "warm", "off"]
         current_index = presets.index(self.current_lighting_preset)
         next_index = (current_index + 1) % len(presets)
         next_preset = presets[next_index]
         self.apply_lighting_preset(next_preset)
 
-    def apply_lighting_preset(self, preset="default"):
+    def apply_lighting_preset(self, preset="studio"):
         '''Apply a predefined lighting preset.'''
         self.current_lighting_preset = preset
         self.renderer.RemoveAllLights()
@@ -802,7 +1069,7 @@ class ViewerApp(QMainWindow):
             headlight.SetColor(1, 1, 1)
             self.renderer.AddLight(headlight)
             self.lights.append(headlight)
-            
+
 
         elif preset == "studio":
             for angle in [45, 135, 225, 315]:
@@ -814,14 +1081,34 @@ class ViewerApp(QMainWindow):
                 self.renderer.AddLight(light)
                 self.lights.append(light)
 
+        elif preset == "warm":
+            # New warm lighting option
+            for angle in [30, 150, 210, 330]:
+                rad = math.radians(angle)
+                light = vtk.vtkLight()
+                light.SetPosition(2.5 * math.cos(rad), 2.5 * math.sin(rad), 1.5)
+                light.SetFocalPoint(0, 0, 0)
+                light.SetIntensity(0.22)
+                light.SetColor(1.0, 0.85, 0.7)  # Warm tone
+                self.renderer.AddLight(light)
+                self.lights.append(light)
+            # Add a soft headlight
+            headlight = vtk.vtkLight()
+            headlight.SetLightTypeToHeadlight()
+            headlight.SetIntensity(0.10)
+            headlight.SetColor(1.0, 0.95, 0.8)
+            self.renderer.AddLight(headlight)
+            self.lights.append(headlight)
+
         elif preset == "off":
             self.lights = []
             # No lights added
-            pass
 
         self.vtk_widget.GetRenderWindow().Render()
         self.statusBar().showMessage(f"Lighting preset: {preset}")
 
+
+    ############### FILE LOAD/SAVE METHODS #################
     def open_file(self):
         '''Open a file dialog to select and load a 3D model file.'''
         filename, _ = QFileDialog.getOpenFileName(
@@ -832,6 +1119,9 @@ class ViewerApp(QMainWindow):
         )
         if filename:
             self.load_model(filename)
+
+
+    ###############  WIREFRAME METHODS #################
 
     def toggle_wireframe(self):
         '''Toggle between wireframe and solid rendering modes.'''
@@ -845,7 +1135,7 @@ class ViewerApp(QMainWindow):
             else:
                 actor.GetProperty().SetRepresentationToSurface()
         self.vtk_widget.GetRenderWindow().Render()
-    
+
 
     ######################## LOAD MODEL METHOD ###########################
     def load_model(self, filename):
@@ -881,6 +1171,7 @@ class ViewerApp(QMainWindow):
                                 texture_data.save(temp_file.name)  # Save the image to the temp file
                                 texture = self.load_texture(temp_file.name)
                                 actor.SetTexture(texture)
+                                os.remove(temp_file.name)  # Clean up temp file
                         else:
                             print("Texture data is missing or invalid. Using default material.")
                     except Exception as e:
@@ -890,7 +1181,7 @@ class ViewerApp(QMainWindow):
 
                 self.renderer.AddActor(actor)
                 self.reset_view()
-                self.renderer.SetBackground(0.9, 0.9, 0.9)  # Light gray
+                self.renderer.SetBackground(0.2, 0.2, 0.2)  # Dark gray
 
             elif ext == ".las":
                 self.load_point_cloud(filename, load_las_as_vtk)
@@ -906,6 +1197,7 @@ class ViewerApp(QMainWindow):
             self.statusBar().showMessage(f"Loaded: {os.path.basename(filename)}")
 
             self.renderer.ResetCamera()
+            self.renderer.ResetCameraClippingRange()
             self.vtk_widget.GetRenderWindow().Render()
 
         except Exception as e:

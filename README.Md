@@ -33,22 +33,48 @@ Make sure you have the following installed:
 • 	pip (Python package manager)
 • 	A code editor like VS Code or PyCharm
 
+> **Note:** Large models and point clouds may require a modern CPU and dedicated GPU for smooth performance. Systems with limited RAM or integrated graphics may experience slow rendering or lag with very large files.
+
+
 ## 📦 Installation of required libraries
 Open a terminal or command prompt and run:
 ```bash
-pip install PyQt5 vtk laspy numpy pye57 PyWavefront trimesh
+pip install PyQt5 vtk laspy numpy pye57 trimesh
 ```
 or
-```sh
-    pip install PyQt5 vtk laspy numpy pye57 PyWavefront trimesh
+```bash
+pip3 install PyQt5 vtk laspy numpy pye57 trimesh
 ```
+or install each package individually:
+```bash
+pip3 install PyQt5
+pip3 install vtk
+pip3 install laspy
+pip3 install numpy
+pip3 install trimesh
+pip3 install pye57
+```
+
+### Mac Users: Installing pye57
+If you are on macOS, you may need to install the native library `xerces-c` before installing `pye57`:
+```sh
+brew install xerces-c
+```
+If installation fails with an error about `libxerces-c-3.2.dylib`, check for the file in `/usr/local/lib`. If it’s missing, create a symlink to the available version:
+```sh
+ln -s /usr/local/lib/libxerces-c-3.3.dylib /usr/local/lib/libxerces-c-3.2.dylib
+```
+
+---
+
 This installs:
 - PyQt5 for the GUI
 - vtk for 3D rendering
-- along with some other things for different file format handling
+- laspy, pye57, trimesh, numpy for file format handling
+
 
 ## 🧪 Usage
-Place a compatible file in the  folder. you can get one from...
+Place a compatible file in the `assets/` folder. You can get one from...
 https://science.nasa.gov/3d-resources/
 https://www.thingiverse.com/
 
@@ -109,10 +135,6 @@ Inside 3d_model_viewer are...
 - `main.py` — the entry point
 - `viewer.py` — the viewer logic
 - `assets/` — store your 3D models and textures here
-
-## License
-
-MIT License
 
 ## Credits
 
