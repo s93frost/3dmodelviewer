@@ -1,0 +1,12 @@
+newmtl WallMaterial
+Ka 0.2 0.2 0.2
+Kd 0.8 0.7 0.6
+Ks 0.5 0.5 0.5
+Ns 30.0
+map_Kd wall_texture.jpg
+newmtl RoofMaterial
+Ka 0.1 0.1 0.1
+Kd 0.6 0.2 0.2
+Ks 0.3 0.3 0.3
+Ns 20.0
+map_Kd roof_texture.jpg
