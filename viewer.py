@@ -13,14 +13,18 @@ import pye57 # For E57 loading
 import trimesh # For alternative OBJ loading
 
 from PyQt5.QtCore import Qt # For Qt constants
-from PyQt5.QtWidgets import QMainWindow, QFileDialog, QAction, QInputDialog, QListWidget, QDockWidget, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton, QColorDialog, QSpinBox, QWidget  # Basic PyQt5 imports
-# from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton, QColorDialog, QSpinBox
+from PyQt5.QtWidgets import (
+    QMainWindow, QFileDialog, QAction, QInputDialog, QListWidget, QDockWidget,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton,
+    QColorDialog, QSpinBox, QWidget, QPlainTextEdit  # Basic PyQt5 imports
+)
 
-from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 import vtkmodules.qt # Ensure VTK Qt support is loaded
 vtkmodules.qt.QVTKRWIBase = 'QGLWidget' # Ensure using QGLWidget
+from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
 
+DEFAULT_TEXTURE = "assets/default_texture.png"
 
 def create_outline_actor(polydata):
     ''' LAS/E57 - Create an outline actor for the given polydata '''
@@ -85,9 +89,18 @@ def load_las_as_vtk(filename):
 
 def load_e57_as_vtk(filename):
     ''' Load E57 file and convert to VTK PolyData '''
-    e57 = pye57.E57(filename)
-    scan = e57.read_scan(0)  # Read the first scan
-    points = np.vstack((scan["cartesianX"], scan["cartesianY"], scan["cartesianZ"])).transpose()
+    try:
+        e57 = pye57.E57(filename)
+        scan = e57.read_scan(0)  # Read the first scan
+    except Exception as e:
+        print(f"Error reading E57 file: {e}")
+        return vtk.vtkPolyData()
+
+    try:
+        points = np.vstack((scan["cartesianX"], scan["cartesianY"], scan["cartesianZ"])).transpose()
+    except Exception as e:
+        print(f"E57 missing coordinate data: {e}")
+        return vtk.vtkPolyData()
 
     vtk_points = vtk.vtkPoints()
     for pt in points:
@@ -97,15 +110,21 @@ def load_e57_as_vtk(filename):
     polydata.SetPoints(vtk_points)
 
     # Optional: color support if available
-    if "colorRed" in scan and "colorGreen" in scan and "colorBlue" in scan:
-        colors = np.vstack((scan["colorRed"], scan["colorGreen"], scan["colorBlue"])).transpose()
-        colors = colors.astype(np.uint8)
-        vtk_colors = vtk.vtkUnsignedCharArray()
-        vtk_colors.SetNumberOfComponents(3)
-        vtk_colors.SetName("Colors")
-        for c in colors:
-            vtk_colors.InsertNextTuple3(*c)
-        polydata.GetPointData().SetScalars(vtk_colors)
+    if all(k in scan for k in ("colorRed", "colorGreen", "colorBlue")):
+        try:
+            colors = np.vstack((scan["colorRed"], scan["colorGreen"], scan["colorBlue"])).transpose()
+            # Normalize if data looks 16-bit
+            if colors.max() > 255:
+                colors = (colors / 65535.0 * 255.0)
+            colors = colors.clip(0, 255).astype(np.uint8)
+            vtk_colors = vtk.vtkUnsignedCharArray()
+            vtk_colors.SetNumberOfComponents(3)
+            vtk_colors.SetName("Colors")
+            for c in colors:
+                vtk_colors.InsertNextTuple3(*c)
+            polydata.GetPointData().SetScalars(vtk_colors)
+        except Exception as e:
+            print(f"Error processing E57 color data: {e}")
 
     return polydata
 
@@ -118,8 +137,7 @@ class CustomQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
 
     def wheelEvent(self, event):
         camera = self.parent.renderer.GetActiveCamera()
-        # Swap zoom factors so scrolling up zooms in, down zooms out
-        zoom_factor = 1.1 if event.angleDelta().y() > 0 else 0.9
+        zoom_factor = 0.9 if event.angleDelta().y() < 0 else 1.1  # up=in, down=out on Mac
         camera.Dolly(zoom_factor)
         self.parent.renderer.ResetCameraClippingRange()
         self.parent.vtk_widget.GetRenderWindow().Render()
@@ -143,14 +161,15 @@ class CustomQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
         elif event.key() == Qt.Key_Down:
             camera.Elevation(rotation_step)
         camera.OrthogonalizeViewUp()
+        self.parent.renderer.ResetCameraClippingRange()
         self.parent.vtk_widget.GetRenderWindow().Render()
 
         if event.key() == Qt.Key_Plus or event.key() == Qt.Key_Equal:
-            camera.Dolly(1.1)  # Zoom out
+            camera.Dolly(1.1)  # Zoom in
             self.parent.renderer.ResetCameraClippingRange()
             self.parent.vtk_widget.GetRenderWindow().Render()
         elif event.key() == Qt.Key_Minus or event.key() == Qt.Key_Underscore:
-            camera.Dolly(0.9)  # Zoom in
+            camera.Dolly(0.9)  # Zoom out
             self.parent.renderer.ResetCameraClippingRange()
             self.parent.vtk_widget.GetRenderWindow().Render()
 
@@ -267,33 +286,55 @@ class ViewerApp(QMainWindow):
         self.setWindowTitle("3D Model Viewer")
         self.setGeometry(100, 100, 800, 600) # Set initial window size
         self.current_lighting_preset = "studio"
+        # Measurement state
         self.measure_points = []  # Store measurement points
         self.measure_markers = [] # Store marker actors for measurements
         self.measure_lines = []   # Store line actors for measurements
-        self.annotations = []     # Store annotation actors
-        # VTK widget
-        self.vtk_widget = CustomQVTKRenderWindowInteractor(self)
-        self.setCentralWidget(self.vtk_widget)
-        # Measurement history and undo/redo stacks
+        self.measure_labels = []
         self.measure_history = []
         self.undo_stack = []
         self.redo_stack = []
+        self.annotations = []
+        # VTK widget
+        self.vtk_widget = CustomQVTKRenderWindowInteractor(self)
+        self.setCentralWidget(self.vtk_widget)
+
+        # Renderer
+        self.renderer = vtk.vtkRenderer()
+        self.vtk_widget.GetRenderWindow().AddRenderer(self.renderer)
+        self.interactor = self.vtk_widget.GetRenderWindow().GetInteractor()
+        self.vtk_widget.setFocus() # Ensure VTK widget has focus for key events
+
+        # Enable depth peeling
+        self.enable_depth_peeling()
+
+        # Mouse interaction styles
+        self.style_switch = vtk.vtkInteractorStyleSwitch()
+        self.interactor.SetInteractorStyle(self.style_switch)
+        self.mouse_styles = ["trackball", "terrain", "joystick"]
+        self.current_mouse_style = "trackball"
+
+        # Keep a terrain style instance alive (used on-demand)
+        self._terrain_style = vtk.vtkInteractorStyleTerrain()
+
+        self.set_mouse_style(self.current_mouse_style)
 
         self.history_list = QListWidget()
+        self.history_list.itemSelectionChanged.connect(self.update_measurement_highlight)
 
         # Create a widget to hold controls and history list
         history_widget = QWidget()
         history_layout = QVBoxLayout(history_widget)
         # Measurement control buttons
-        btn_start = QPushButton("Start Measuring")
-        btn_start.clicked.connect(self.activate_measure_mode)
-        history_layout.addWidget(btn_start)
-        btn_stop = QPushButton("Stop Measuring")
-        btn_stop.clicked.connect(self.cancel_measurement)
-        history_layout.addWidget(btn_stop)
-        btn_clear_last = QPushButton("Clear Last Measurement")
-        btn_clear_last.clicked.connect(self.clear_last_measurement)
-        history_layout.addWidget(btn_clear_last)
+        self.btn_start = QPushButton("Start Measuring")
+        self.btn_start.clicked.connect(self.activate_measure_mode)
+        history_layout.addWidget(self.btn_start)
+        self.btn_stop = QPushButton("Stop Measuring")
+        self.btn_stop.clicked.connect(self.cancel_measurement)
+        history_layout.addWidget(self.btn_stop)
+        self.btn_clear_last = QPushButton("Clear Last Measurement")
+        self.btn_clear_last.clicked.connect(self.clear_last_measurement)
+        history_layout.addWidget(self.btn_clear_last)
         btn_clear_all = QPushButton("Clear All Measurements")
         btn_clear_all.clicked.connect(self.clear_all_measurements)
         history_layout.addWidget(btn_clear_all)
@@ -312,8 +353,17 @@ class ViewerApp(QMainWindow):
 
         self.history_dock = QDockWidget("Measurements", self)
         self.history_dock.setWidget(history_widget)
-        self.history_dock.setFeatures(QDockWidget.DockWidgetMovable)  # Only allow moving, not closing or floating
+        self.history_dock.setFeatures(QDockWidget.DockWidgetMovable) # Only allow moving, not closing or floating
         self.addDockWidget(Qt.LeftDockWidgetArea, self.history_dock)
+
+        # Model Info dock
+        self.info_text = QPlainTextEdit()
+        self.info_text.setReadOnly(True)
+        self.info_text.setStyleSheet("font-family: Menlo, monospace; font-size: 12px;")
+        self.info_dock = QDockWidget("Model Info", self)
+        self.info_dock.setWidget(self.info_text)
+        self.info_dock.setFeatures(QDockWidget.DockWidgetMovable)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.info_dock)
 
         self.background_colors = [
             (1, 1, 1),        # White
@@ -321,19 +371,13 @@ class ViewerApp(QMainWindow):
             (0.2, 0.2, 0.2),  # Dark Gray
             (0, 0, 0)         # Black
         ]
-        self.background_index = 2  # Start with dark gray
+        self.background_index = 2
+        self.set_background_color(*self.background_colors[self.background_index])
 
-        # Renderer
-        self.renderer = vtk.vtkRenderer()
-        self.vtk_widget.GetRenderWindow().AddRenderer(self.renderer)
-        self.interactor = self.vtk_widget.GetRenderWindow().GetInteractor()
-        self.vtk_widget.setFocus() # Ensure VTK widget has focus for key events
-        # Enable depth peeling
-        self.enable_depth_peeling()
         # Menu
         self.init_menu()
         # Load default model
-        default_model = "assets/Tiger1MidHullThickMachineGun.stl"
+        default_model = "assets/house.obj"
         if os.path.exists(default_model):
             self.load_model(default_model)
 
@@ -364,12 +408,33 @@ class ViewerApp(QMainWindow):
         # Add zoom in/out actions
         zoom_in_action = QAction("Zoom In", self)
         zoom_in_action.setShortcut("Ctrl++")
-        zoom_in_action.triggered.connect(lambda: self.zoom_camera(0.9))
+        zoom_in_action.triggered.connect(lambda: self.zoom_camera(1.1))  # Zoom in
         view_menu.addAction(zoom_in_action)
         zoom_out_action = QAction("Zoom Out", self)
         zoom_out_action.setShortcut("Ctrl+-")
-        zoom_out_action.triggered.connect(lambda: self.zoom_camera(1.1))
+        zoom_out_action.triggered.connect(lambda: self.zoom_camera(0.9))  # Zoom out
         view_menu.addAction(zoom_out_action)
+        # Refresh model info action
+        refresh_info_action = QAction("Refresh Model Info", self)
+        refresh_info_action.setShortcut("I")
+        refresh_info_action.triggered.connect(self.update_model_info)
+        view_menu.addAction(refresh_info_action)
+
+        ########### MOUSE MENU ##############
+        mouse_menu = menubar.addMenu("Mouse")
+        act_trackball = QAction("Style: Trackball", self)
+        act_trackball.triggered.connect(lambda: self.set_mouse_style("trackball"))
+        mouse_menu.addAction(act_trackball)
+        act_terrain = QAction("Style: Terrain", self)
+        act_terrain.triggered.connect(lambda: self.set_mouse_style("terrain"))
+        mouse_menu.addAction(act_terrain)
+        act_joystick = QAction("Style: Joystick", self)
+        act_joystick.triggered.connect(lambda: self.set_mouse_style("joystick"))
+        mouse_menu.addAction(act_joystick)
+        act_cycle = QAction("Cycle Mouse Style", self)
+        act_cycle.setShortcut("M")
+        act_cycle.triggered.connect(self.cycle_mouse_style)
+        mouse_menu.addAction(act_cycle)
 
         ########### WIREFRAME MENU ##############
         wireframe_menu = menubar.addMenu("Wireframe")
@@ -559,14 +624,12 @@ class ViewerApp(QMainWindow):
         actors = self.renderer.GetActors()
         actors.InitTraversal()
         actor_count = actors.GetNumberOfItems()
-        print(f"Number of actors in the scene: {actor_count}")
 
         if actor_count == 0:
             self.statusBar().showMessage("No actors in the scene to reset view.")
             return
 
         bounds = self.renderer.ComputeVisiblePropBounds()
-        print(f"Scene bounds: {bounds}")
 
         if bounds == (0, 0, 0, 0, 0, 0):
             self.statusBar().showMessage("Scene bounds are invalid. Cannot reset view.")
@@ -591,6 +654,35 @@ class ViewerApp(QMainWindow):
 
         self.vtk_widget.GetRenderWindow().Render()
         self.statusBar().showMessage("View reset to default position.")
+
+    def set_mouse_style(self, name: str):
+        """Set mouse interaction style: trackball | terrain | joystick."""
+        name = name.lower()
+        if name == "trackball":
+            # Reattach the switch, then select trackball
+            self.interactor.SetInteractorStyle(self.style_switch)
+            self.style_switch.SetCurrentStyleToTrackballCamera()
+        elif name == "joystick":
+            # Reattach the switch, then select joystick
+            self.interactor.SetInteractorStyle(self.style_switch)
+            self.style_switch.SetCurrentStyleToJoystickCamera()
+        elif name == "terrain":
+            # Not available via switch on this VTK; use terrain style directly
+            self.interactor.SetInteractorStyle(self._terrain_style)
+        else:
+            # Fallback to trackball
+            self.interactor.SetInteractorStyle(self.style_switch)
+            self.style_switch.SetCurrentStyleToTrackballCamera()
+            name = "trackball"
+
+        self.current_mouse_style = name
+        self.statusBar().showMessage(f"Mouse style: {name.capitalize()}")
+
+    def cycle_mouse_style(self):
+        """Cycle through available mouse styles."""
+        i = self.mouse_styles.index(self.current_mouse_style)
+        nxt = self.mouse_styles[(i + 1) % len(self.mouse_styles)]
+        self.set_mouse_style(nxt)
 
     def load_texture(self, texture_path):
         '''Load a texture from file and return a vtkTexture object'''
@@ -648,6 +740,8 @@ class ViewerApp(QMainWindow):
         self.renderer.AddActor(outline_actor)
         actor.GetProperty().SetPointSize(2)
         self.renderer.AddActor(actor)
+        self.update_model_info()
+        self.reset_view()
 
     def deactivate_all_modes(self):
         '''Deactivate all active modes.'''
@@ -665,23 +759,63 @@ class ViewerApp(QMainWindow):
         """Forward key press events to the VTK widget's handler."""
         self.vtk_widget.keyPressEvent(event)
 
-        # Rotation step size (in degrees)
-        rotation_step = 5
 
-        camera = self.renderer.GetActiveCamera()
+    def update_model_info(self):
+        """Collect scene stats and show in the Model Info dock."""
+        try:
+            actors = self.renderer.GetActors()
+            actors.InitTraversal()
+            n_actors = actors.GetNumberOfItems()
 
-        if event.key() == Qt.Key_Left:
-            camera.Azimuth(rotation_step)
-        elif event.key() == Qt.Key_Right:
-            camera.Azimuth(-rotation_step)
-        elif event.key() == Qt.Key_Up:
-            camera.Elevation(-rotation_step)
-        elif event.key() == Qt.Key_Down:
-            camera.Elevation(rotation_step)
+            total_points = 0
+            total_polys = 0
+            total_lines = 0
+            total_strips = 0
+            textured = 0
 
-        # Update the camera view
-        camera.OrthogonalizeViewUp()
-        self.vtk_widget.GetRenderWindow().Render()
+            for _ in range(n_actors):
+                a = actors.GetNextActor()
+                if a is None:
+                    continue
+                mapper = a.GetMapper()
+                if mapper is None:
+                    continue
+                data = mapper.GetInput()
+                if isinstance(data, vtk.vtkPolyData):
+                    total_points += int(data.GetNumberOfPoints() or 0)
+                    total_polys  += int(data.GetNumberOfPolys() or 0)
+                    total_lines  += int(data.GetNumberOfLines() or 0)
+                    total_strips += int(data.GetNumberOfStrips() or 0)
+                if a.GetTexture() is not None:
+                    textured += 1
+
+            bounds = self.renderer.ComputeVisiblePropBounds()
+            bx = (bounds[0], bounds[1])
+            by = (bounds[2], bounds[3])
+            bz = (bounds[4], bounds[5])
+            sx = bx[1] - bx[0]
+            sy = by[1] - by[0]
+            sz = bz[1] - bz[0]
+
+            info = []
+            info.append("Model Info")
+            info.append("-----------------------------")
+            info.append(f"Actors:            {n_actors}")
+            info.append(f"Textured actors:   {textured}")
+            info.append("")
+            info.append(f"Points (vertices): {total_points}")
+            info.append(f"Polys (faces):     {total_polys}")
+            info.append(f"Lines:             {total_lines}")
+            info.append(f"Strips:            {total_strips}")
+            info.append("")
+            info.append(f"Bounds X: [{bx[0]:.3f}, {bx[1]:.3f}]  size: {sx:.3f}")
+            info.append(f"Bounds Y: [{by[0]:.3f}, {by[1]:.3f}]  size: {sy:.3f}")
+            info.append(f"Bounds Z: [{bz[0]:.3f}, {bz[1]:.3f}]  size: {sz:.3f}")
+
+            self.info_text.setPlainText("\n".join(info))
+            self.statusBar().showMessage("Model info refreshed.")
+        except Exception as e:
+            self.info_text.setPlainText(f"Model Info\n-----------------------------\nError: {e}")
 
 
     ############### MEASUREMENT METHODS #################
@@ -689,14 +823,7 @@ class ViewerApp(QMainWindow):
     def activate_measure_mode(self):
         '''Activate measurement mode to measure distances.'''
         self.deactivate_all_modes()  # Ensure no other mode is active
-        # Remove previous observers if they exist
-        if hasattr(self, "left_click_observer"):
-            self.vtk_widget.RemoveObserver(self.left_click_observer)
-            del self.left_click_observer
-        if hasattr(self, "right_click_observer"):
-            self.vtk_widget.RemoveObserver(self.right_click_observer)
-            del self.right_click_observer
-        # Do NOT reset the lists here!
+        self.btn_start.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold;")
         self.statusBar().showMessage("Click points to measure. Right-click to finish.")
         self.left_click_observer = self.vtk_widget.AddObserver("LeftButtonPressEvent", self.on_measure_click)
         self.right_click_observer = self.vtk_widget.AddObserver("RightButtonPressEvent", self.finish_measure)
@@ -710,9 +837,11 @@ class ViewerApp(QMainWindow):
             self.vtk_widget.RemoveObserver(self.right_click_observer)
             del self.right_click_observer
         # Do NOT remove marker/line actors or clear lists here!
+        # Do NOT clear measure_points here; keep indices consistent for deletion logic
         # Only clear temporary measurement points if needed:
-        self.measure_points.clear()
+        # self.measure_points.clear()
         self.statusBar().showMessage("Measurement cancelled.")
+        self.btn_start.setStyleSheet("")
 
     def on_measure_click(self, obj, event):
         '''Handle click to add measurement point.'''
@@ -760,6 +889,19 @@ class ViewerApp(QMainWindow):
                 actor.GetProperty().SetLineWidth(2)
                 self.renderer.AddActor(actor)
                 self.measure_lines.append(actor)
+
+                # Add distance label at the line midpoint
+                mx = 0.5 * (p1[0] + p2[0])
+                my = 0.5 * (p1[1] + p2[1])
+                mz = 0.5 * (p1[2] + p2[2])
+                label = vtk.vtkBillboardTextActor3D()
+                label.SetInput(f"{dist:.3f}")
+                label.SetPosition(mx, my, mz)
+                label.GetTextProperty().SetColor(1, 1, 0)  # yellow
+                label.GetTextProperty().SetFontSize(18)
+                self.renderer.AddActor(label)
+                self.measure_labels.append(label)
+
                 self.vtk_widget.GetRenderWindow().Render()
 
     def finish_measure(self, obj, event):
@@ -772,10 +914,14 @@ class ViewerApp(QMainWindow):
             self.statusBar().showMessage(f"Measurement finished. Total path length: {total:.3f}")
         else:
             self.statusBar().showMessage("Measurement cancelled or not enough points.")
-        # Remove observers
-        self.vtk_widget.RemoveObserver(self.left_click_observer)
-        self.vtk_widget.RemoveObserver(self.right_click_observer)
-        # Optionally, clear measurement after a delay or on next activation
+        # Remove observers (guard with hasattr)
+        if hasattr(self, "left_click_observer"):
+            self.vtk_widget.RemoveObserver(self.left_click_observer)
+            del self.left_click_observer
+        if hasattr(self, "right_click_observer"):
+            self.vtk_widget.RemoveObserver(self.right_click_observer)
+            del self.right_click_observer
+        self.btn_start.setStyleSheet("")
 
     def measure_total(self):
         '''Calculate total path length of measurements.'''
@@ -798,10 +944,14 @@ class ViewerApp(QMainWindow):
             for actor in list(self.measure_lines):
                 self.renderer.RemoveActor(actor)
             self.measure_lines.clear()
-        # Clear points
+        # Remove label actors
+        if hasattr(self, "measure_labels"):
+            for actor in list(self.measure_labels):
+                self.renderer.RemoveActor(actor)
+            self.measure_labels.clear()
+        # Clear points/history/stacks/UI
         if hasattr(self, "measure_points"):
             self.measure_points.clear()
-        # Clear measurement history and undo/redo stacks
         self.measure_history.clear()
         self.undo_stack.clear()
         self.redo_stack.clear()
@@ -819,6 +969,10 @@ class ViewerApp(QMainWindow):
         if hasattr(self, "measure_lines") and self.measure_lines:
             actor = self.measure_lines.pop()
             self.renderer.RemoveActor(actor)
+        # Remove last label
+        if hasattr(self, "measure_labels") and self.measure_labels:
+            actor = self.measure_labels.pop()
+            self.renderer.RemoveActor(actor)
         # Remove last point
         if hasattr(self, "measure_points") and self.measure_points:
             self.measure_points.pop()
@@ -830,74 +984,60 @@ class ViewerApp(QMainWindow):
         self.vtk_widget.GetRenderWindow().Render()
         self.statusBar().showMessage("Last measurement cleared.")
 
+
     def delete_selected_measurement(self):
-        '''Delete the selected measurement from history and scene.'''
+        '''Delete selected measurement rows; remove correct actors; skip "Total" rows.'''
         selected_items = self.history_list.selectedItems()
         if not selected_items:
             self.statusBar().showMessage("No measurement selected.")
             return
 
-        # Collect rows to delete, sort in reverse so indices don't shift
+        # Map rows -> segment index (skip "Total")
+        row_to_seg = {}
+        seg_idx = 0
+        for i in range(self.history_list.count()):
+            text = self.history_list.item(i).text()
+            if text.startswith("Total"):
+                row_to_seg[i] = None
+            else:
+                row_to_seg[i] = seg_idx
+                seg_idx += 1
+
         rows = sorted([self.history_list.row(item) for item in selected_items], reverse=True)
         for row in rows:
+            item = self.history_list.item(row)
+            text = item.text() if item else ""
             self.history_list.takeItem(row)
-            # Remove from measure_history
-            if row < len(self.measure_history):
-                del self.measure_history[row]
-            # Remove corresponding line actor
-            if row < len(self.measure_lines):
-                actor = self.measure_lines[row]
-                self.renderer.RemoveActor(actor)
-                del self.measure_lines[row]
-            # Remove corresponding markers
-            # Remove marker at segment end
-            if row + 1 < len(self.measure_markers):
-                actor = self.measure_markers[row + 1]
-                self.renderer.RemoveActor(actor)
-                del self.measure_markers[row + 1]
-            # Remove marker at segment start only if it's not shared with previous segment
-            if row < len(self.measure_markers):
-                actor = self.measure_markers[row]
-                self.renderer.RemoveActor(actor)
-                del self.measure_markers[row]
-            # Remove corresponding points
-            if row + 1 < len(self.measure_points):
-                del self.measure_points[row + 1]
-            if row < len(self.measure_points):
-                del self.measure_points[row]
+
+            seg = row_to_seg.get(row, None)
+            if seg is None:
+                # Skip totals entirely; do not touch measure_history
+                continue
+
+            # Remove segment visuals
+            total_lines = len(self.measure_lines)
+            has_prev = (seg - 1) >= 0
+            has_next = (seg + 1) < total_lines
+            if seg < len(self.measure_lines):
+                self.renderer.RemoveActor(self.measure_lines[seg])
+                del self.measure_lines[seg]
+            if seg < len(self.measure_labels):
+                self.renderer.RemoveActor(self.measure_labels[seg])
+                del self.measure_labels[seg]
+            if (seg + 1) < len(self.measure_markers) and not has_next:
+                self.renderer.RemoveActor(self.measure_markers[seg + 1])
+                del self.measure_markers[seg + 1]
+                if (seg + 1) < len(self.measure_points):
+                    del self.measure_points[seg + 1]
+            if seg < len(self.measure_markers) and not has_prev:
+                self.renderer.RemoveActor(self.measure_markers[seg])
+                del self.measure_markers[seg]
+                if seg < len(self.measure_points):
+                    del self.measure_points[seg]
         self.vtk_widget.GetRenderWindow().Render()
+        self.update_measurement_highlight()
         self.statusBar().showMessage("Selected measurement(s) deleted.")
 
-        # Collect rows to delete, sort in reverse so indices don't shift
-        rows = sorted([self.history_list.row(item) for item in selected_items], reverse=True)
-        for row in rows:
-            self.history_list.takeItem(row)
-            # Remove from measure_history
-            if row < len(self.measure_history):
-                del self.measure_history[row]
-            # Remove corresponding line actor
-            if row < len(self.measure_lines):
-                actor = self.measure_lines[row]
-                self.renderer.RemoveActor(actor)
-                del self.measure_lines[row]
-            # Remove corresponding markers
-            # Remove marker at segment end
-            if row + 1 < len(self.measure_markers):
-                actor = self.measure_markers[row + 1]
-                self.renderer.RemoveActor(actor)
-                del self.measure_markers[row + 1]
-            # Remove marker at segment start only if it's not shared with previous segment
-            if row < len(self.measure_markers):
-                actor = self.measure_markers[row]
-                self.renderer.RemoveActor(actor)
-                del self.measure_markers[row]
-            # Remove corresponding points
-            if row + 1 < len(self.measure_points):
-                del self.measure_points[row + 1]
-            if row < len(self.measure_points):
-                del self.measure_points[row]
-        self.vtk_widget.GetRenderWindow().Render()
-        self.statusBar().showMessage("Selected measurement(s) deleted.")
 
     def undo_measurement(self):
         '''Undo the last measurement.'''
@@ -917,9 +1057,32 @@ class ViewerApp(QMainWindow):
             if action == 'add':
                 self.measure_history.append(value)
                 self.undo_stack.append(('add', value))
-                self.history_list.addItem(f"Redo: {value:.3f}")
+                # Keep list format consistent
+                self.history_list.addItem(f"Segment: {value:.3f}")
                 self.statusBar().showMessage("Redo last measurement.")
-            # Optionally, restore marker/line actor here
+
+
+    def update_measurement_highlight(self):
+        # Reset
+        for line in self.measure_lines:
+            p = line.GetProperty()
+            p.SetColor(1, 0, 0); p.SetLineWidth(2.0)
+        # Map rows to segments (skip 'Total')
+        row_to_seg, seg = {}, 0
+        for i in range(self.history_list.count()):
+            txt = self.history_list.item(i).text()
+            if txt.startswith("Total"):
+                row_to_seg[i] = None
+            else:
+                row_to_seg[i] = seg; seg += 1
+        # Highlight selected
+        for item in self.history_list.selectedItems():
+            r = self.history_list.row(item)
+            s = row_to_seg.get(r)
+            if s is not None and 0 <= s < len(self.measure_lines):
+                p = self.measure_lines[s].GetProperty()
+                p.SetColor(1, 1, 0); p.SetLineWidth(4.0)
+        self.vtk_widget.GetRenderWindow().Render()
 
 
     ############### ANNOTATION METHODS #################
@@ -1137,26 +1300,325 @@ class ViewerApp(QMainWindow):
         self.vtk_widget.GetRenderWindow().Render()
 
 
+    ###############  LOADING METHODS #################
+
+    def _find_mtl_and_texture_dir(self, obj_path: str):
+        """Parse OBJ for mtllib and choose a sensible texture directory."""
+        obj_dir = os.path.dirname(obj_path)
+        mtl_path = None
+
+        # Parse mtllib from OBJ (use first that exists)
+        try:
+            with open(obj_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.lower().startswith("mtllib"):
+                        parts = line.split(maxsplit=1)
+                        if len(parts) == 2:
+                            candidate = parts[1].strip()
+                            # Resolve relative to OBJ directory
+                            cand_path = os.path.normpath(os.path.join(obj_dir, candidate))
+                            if os.path.isfile(cand_path):
+                                mtl_path = cand_path
+                                break
+        except Exception as e:
+            print(f"Warning: failed to read OBJ for mtllib: {e}")
+
+        # Fallback to base.mtl if no mtllib found
+        if mtl_path is None:
+            base = os.path.splitext(os.path.basename(obj_path))[0]
+            guess = os.path.join(obj_dir, base + ".mtl")
+            if os.path.isfile(guess):
+                mtl_path = guess
+
+        # Choose texture path: prefer alongside MTL, else OBJ dir, else textures/ subdir
+        texture_dir = os.path.dirname(mtl_path) if mtl_path else obj_dir
+        textures_sub = os.path.join(texture_dir, "textures")
+        if os.path.isdir(textures_sub):
+            texture_dir = textures_sub
+
+        return mtl_path, texture_dir
+
+
+    def _rewrite_obj_mtllib(self, obj_path: str, patched_mtl_path: str) -> str:
+        """Write a temporary OBJ that points to the patched MTL (single mtllib)."""
+        import tempfile
+        lines = []
+        try:
+            with open(obj_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    # Drop existing mtllib lines
+                    if line.strip().lower().startswith("mtllib"):
+                        continue
+                    lines.append(line)
+        except Exception as e:
+            print(f"OBJ read failed: {e}")
+        # Prepend our mtllib
+        mtllib_line = f"mtllib {os.path.basename(patched_mtl_path)}\n"
+        lines.insert(0, mtllib_line)
+
+        tmp = tempfile.NamedTemporaryFile(prefix="patched_", suffix=".obj", delete=False)
+        tmp.write("".join(lines).encode("utf-8"))
+        tmp.flush(); tmp.close()
+        return tmp.name
+
+    def _scan_obj_materials(self, obj_path: str):
+        used = []
+        try:
+            with open(obj_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip()
+                    if s.lower().startswith("usemtl"):
+                        parts = s.split(None, 1)
+                        if len(parts) == 2:
+                            used.append(parts[1].strip())
+        except Exception as e:
+            print(f"OBJ scan failed: {e}")
+        return used
+
+    def _parse_mtl(self, mtl_path: str):
+        defined = set()
+        maps = {}
+        try:
+            with open(mtl_path, "r", encoding="utf-8", errors="ignore") as f:
+                cur = None
+                for line in f:
+                    s = line.strip()
+                    sl = s.lower()
+                    if sl.startswith("newmtl "):
+                        cur = s.split(None, 1)[1].strip()
+                        defined.add(cur)
+                    elif cur and sl.startswith("map_kd"):
+                        parts = s.split(None, 1)
+                        if len(parts) == 2:
+                            maps[cur] = parts[1].strip()
+        except Exception as e:
+            print(f"MTL parse failed: {e}")
+        return defined, maps
+
+    def _resolve_texture_file(self, tex_name: str, texture_dir: str):
+        """Resolve a texture by trying:
+           - exact path under texture_dir,
+           - basename in texture_dir,
+           - alternate extensions,
+           - textures/ subfolder,
+           - recursive search with fuzzy match on basename stem.
+           Returns a path RELATIVE to texture_dir if found, else None.
+        """
+        import re
+
+        def norm_stem(p):
+            stem = os.path.splitext(os.path.basename(p))[0]
+            return "".join(ch.lower() for ch in stem if ch.isalnum())
+
+        def stem_tokens(p):
+            s = os.path.splitext(os.path.basename(p))[0].lower()
+            return [t for t in re.split(r"[^a-z0-9]+", s) if len(t) >= 3]
+
+        abs_dir = os.path.abspath(texture_dir)
+        raw = tex_name.strip().strip('"').strip("'")
+        base = os.path.basename(raw)
+        stem, ext = os.path.splitext(base)
+
+        # Candidate direct paths
+        candidates = [
+            os.path.join(abs_dir, raw),
+            os.path.join(abs_dir, base),
+        ]
+        # Broaden supported extensions
+        alt_exts = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".tga",
+                    ".PNG", ".JPG", ".JPEG", ".BMP", ".TIF", ".TIFF", ".TGA"]
+        for alt in ([ext] if ext else []) + alt_exts:
+            if alt:
+                candidates.append(os.path.join(abs_dir, stem + alt))
+
+        # Try textures/ subfolder
+        tex_sub = os.path.join(abs_dir, "textures")
+        for alt in ([ext] if ext else []) + alt_exts:
+            if alt:
+                candidates.append(os.path.join(tex_sub, stem + alt))
+
+        for c in candidates:
+            if os.path.isfile(c):
+                return os.path.relpath(c, abs_dir)
+
+        # Recursive search: exact match on filename or stem, else fuzzy token match
+        target_base = base.lower()
+        target_norm = norm_stem(base)
+        target_tokens = set(stem_tokens(base))
+
+        best_match = None
+        best_score = -1
+        for root, _, files in os.walk(abs_dir):
+            for f in files:
+                fl = f.lower()
+                fstem_norm = norm_stem(f)
+                if fl == target_base or fstem_norm == target_norm:
+                    return os.path.relpath(os.path.join(root, f), abs_dir)
+                # Fuzzy: share any meaningful token (e.g., 'wall', 'roof')
+                ftokens = set(stem_tokens(f))
+                score = len(target_tokens & ftokens)
+                if score > best_score and score > 0:
+                    best_score = score
+                    best_match = os.path.join(root, f)
+
+        if best_match:
+            return os.path.relpath(best_match, abs_dir)
+        return None
+
+
+    def _rewrite_mtl(self, obj_path: str, mtl_path: str, texture_dir: str) -> str:
+        """Patch MTL: fix map_Kd paths and add stubs for all used-but-undefined materials."""
+        used = self._scan_obj_materials(obj_path)
+        defined, _ = self._parse_mtl(mtl_path) if mtl_path else (set(), {})
+        out_lines = []
+        if mtl_path and os.path.isfile(mtl_path):
+            with open(mtl_path, "r", encoding="utf-8", errors="ignore") as f:
+                out_lines = f.readlines()
+
+        # Fix map_Kd paths (try alternate extensions/locations)
+        replaced = 0
+        missing_list = []
+        for i, line in enumerate(out_lines):
+            s = line.strip()
+            if s.lower().startswith("map_kd"):
+                parts = s.split(None, 1)
+                tex_raw = parts[1].strip() if len(parts) == 2 else ""
+                resolved = self._resolve_texture_file(tex_raw, texture_dir)
+                if resolved:
+                    out_lines[i] = f"map_Kd {resolved}\n"
+                    replaced += 1
+                else:
+                    # Use fallback texture if available
+                    fallback = self._resolve_texture_file(DEFAULT_TEXTURE, texture_dir)
+                    if fallback:
+                        out_lines[i] = f"map_Kd {fallback}\n"
+                    else:
+                        out_lines[i] = f"# map_Kd {tex_raw}  # missing\n"
+                    missing_list.append(tex_raw)
+        if missing_list:
+            self.statusBar().showMessage(
+                f"Missing textures: {', '.join(missing_list)}"
+            )
+            print(f"Textures not found for map_Kd in {texture_dir}: {missing_list}")
+        if replaced:
+            self.statusBar().showMessage(
+                f"Patched {replaced} map_Kd path(s) in MTL."
+            )
+            print(f"Patched {replaced} map_Kd path(s) in MTL.")
+
+        # Add stubs for used-but-undefined materials
+        missing = [m for m in used if m not in defined]
+        if missing:
+            out_lines.append("\n# --- Auto-added stub materials ---\n")
+            for name in missing:
+                out_lines.append(f"newmtl {name}\nKd 0.8 0.8 0.8\nKa 0 0 0\nKs 0 0 0\nNs 0\nillum 1\n")
+
+        tmp = tempfile.NamedTemporaryFile(prefix="patched_", suffix=".mtl", delete=False)
+        tmp.write("".join(out_lines).encode("utf-8"))
+        tmp.flush(); tmp.close()
+        return tmp.name
+
+
+    def load_obj_with_textures(self, obj_path: str):
+        '''Load an OBJ with MTL/PNG/JPG textures and add to the existing renderer.'''
+        ren_win = self.vtk_widget.GetRenderWindow()
+
+        # Track existing renderers
+        before = []
+        rens = ren_win.GetRenderers(); rens.InitTraversal()
+        for _ in range(rens.GetNumberOfItems()):
+            before.append(rens.GetNextItem())
+
+        mtl_path, texture_dir = self._find_mtl_and_texture_dir(obj_path)
+        patched_mtl = self._rewrite_mtl(obj_path, mtl_path, texture_dir)
+        patched_obj = self._rewrite_obj_mtllib(obj_path, patched_mtl)
+
+        importer = vtk.vtkOBJImporter()
+        importer.SetRenderWindow(ren_win)
+        importer.SetFileName(patched_obj)          # force use of our patched OBJ
+        importer.SetFileNameMTL(patched_mtl)       # and our patched MTL
+        importer.SetTexturePath(os.path.abspath(texture_dir))
+
+        try:
+            importer.Update()
+        except Exception as e:
+            self.statusBar().showMessage(f"Failed to import OBJ: {e}")
+            return
+
+        # Move imported props/lights to our renderer
+        after = []
+        rens = ren_win.GetRenderers(); rens.InitTraversal()
+        for _ in range(rens.GetNumberOfItems()):
+            after.append(rens.GetNextItem())
+        new_renderers = [r for r in after if r not in before and r is not self.renderer]
+        
+        for r in new_renderers:
+            actors = r.GetActors(); actors.InitTraversal()
+            for _ in range(actors.GetNumberOfItems()):
+                a = actors.GetNextActor()
+                # Compute normals for better shading
+                mapper = a.GetMapper()
+                polydata = mapper.GetInput() if mapper else None
+                if isinstance(polydata, vtk.vtkPolyData):
+                    normals = vtk.vtkPolyDataNormals()
+                    normals.SetInputData(polydata)
+                    normals.SplittingOff()
+                    normals.ConsistencyOn()
+                    normals.AutoOrientNormalsOn()
+                    normals.Update()
+                    mapper.SetInputConnection(normals.GetOutputPort())
+                self.renderer.AddActor(a)
+                if a.GetTexture() is not None:
+                    a.GetTexture().InterpolateOn()
+
+        # Cleanup temp files
+        for tmpf in [patched_obj, patched_mtl]:
+            try:
+                if tmpf and os.path.exists(tmpf):
+                    os.remove(tmpf)
+            except Exception:
+                pass
+
+        self.renderer.ResetCamera()
+        self.renderer.ResetCameraClippingRange()
+        ren_win.Render()
+        self.statusBar().showMessage("OBJ loaded with patched materials.")
+
     ######################## LOAD MODEL METHOD ###########################
     def load_model(self, filename):
         '''Load a 3D model from the specified file.'''
+        # Clear current scene
         self.renderer.RemoveAllViewProps()
         ext = os.path.splitext(filename)[1].lower()
 
         try:
-            if ext in [".obj", ".stl", ".ply"]:
-                # Load the model using trimesh
-                mesh = trimesh.load(filename, force='mesh')
 
-                # Convert to VTK
+            if ext == ".obj":
+                # Use VTK OBJ importer to load MTL/PNG textures correctly
+                self.load_obj_with_textures(filename)
+
+            elif ext in [".stl", ".ply"]:
+                mesh = trimesh.load(filename, force='mesh')
                 polydata = self.trimesh_to_vtk(mesh)
 
-                # Create VTK mapper and actor
+                # Compute normals for better lighting/shading
+                normals = vtk.vtkPolyDataNormals()
+                normals.SetInputData(polydata)
+                normals.SplittingOff()
+                normals.ConsistencyOn()
+                normals.AutoOrientNormalsOn()
+                normals.Update()
+
                 mapper = vtk.vtkPolyDataMapper()
-                mapper.SetInputData(polydata)
+                mapper.SetInputConnection(normals.GetOutputPort())
                 actor = vtk.vtkActor()
                 actor.SetMapper(mapper)
+                self.renderer.AddActor(actor)
 
+                self.reset_view()
+
+                '''
                 # Only check for textures if the file format supports them
                 if ext == ".obj" and hasattr(mesh, "visual") and mesh.visual.kind == "texture":
                     texture_data = mesh.visual.material.image
@@ -1181,7 +1643,9 @@ class ViewerApp(QMainWindow):
 
                 self.renderer.AddActor(actor)
                 self.reset_view()
-                self.renderer.SetBackground(0.2, 0.2, 0.2)  # Dark gray
+                # self.renderer.SetBackground(0.2, 0.2, 0.2)  # Dark gray
+                self.set_background_color(0.2, 0.2, 0.2)
+                '''
 
             elif ext == ".las":
                 self.load_point_cloud(filename, load_las_as_vtk)
@@ -1190,14 +1654,15 @@ class ViewerApp(QMainWindow):
                 self.load_point_cloud(filename, load_e57_as_vtk)
 
             else:
+                self.statusBar().showMessage(f"Unsupported file format: {ext}")
                 print(f"Unsupported file format: {ext}")
                 return
 
+            # Apply current lighting and finalize view
             self.apply_lighting_preset(self.current_lighting_preset)
             self.statusBar().showMessage(f"Loaded: {os.path.basename(filename)}")
-
-            self.renderer.ResetCamera()
             self.renderer.ResetCameraClippingRange()
+            self.update_model_info()
             self.vtk_widget.GetRenderWindow().Render()
 
         except Exception as e:
