@@ -108,6 +108,18 @@ def load_e57_as_vtk(filename):
     except Exception as e:
         print(f"E57 missing coordinate data: {e}")
         return vtk.vtkPolyData()
+    try:
+        e57 = pye57.E57(filename)
+        scan = e57.read_scan(0)  # Read the first scan
+    except Exception as e:
+        print(f"Error reading E57 file: {e}")
+        return vtk.vtkPolyData()
+
+    try:
+        points = np.vstack((scan["cartesianX"], scan["cartesianY"], scan["cartesianZ"])).transpose()
+    except Exception as e:
+        print(f"E57 missing coordinate data: {e}")
+        return vtk.vtkPolyData()
 
     vtk_points = vtk.vtkPoints()
     for pt in points:
@@ -117,6 +129,21 @@ def load_e57_as_vtk(filename):
     polydata.SetPoints(vtk_points)
 
     # Optional: color support if available
+    if all(k in scan for k in ("colorRed", "colorGreen", "colorBlue")):
+        try:
+            colors = np.vstack((scan["colorRed"], scan["colorGreen"], scan["colorBlue"])).transpose()
+            # Normalize if data looks 16-bit
+            if colors.max() > 255:
+                colors = (colors / 65535.0 * 255.0)
+            colors = colors.clip(0, 255).astype(np.uint8)
+            vtk_colors = vtk.vtkUnsignedCharArray()
+            vtk_colors.SetNumberOfComponents(3)
+            vtk_colors.SetName("Colors")
+            for c in colors:
+                vtk_colors.InsertNextTuple3(*c)
+            polydata.GetPointData().SetScalars(vtk_colors)
+        except Exception as e:
+            print(f"Error processing E57 color data: {e}")
     if all(k in scan for k in ("colorRed", "colorGreen", "colorBlue")):
         try:
             colors = np.vstack((scan["colorRed"], scan["colorGreen"], scan["colorBlue"])).transpose()
@@ -145,6 +172,7 @@ class CustomQVTKRenderWindowInteractor(QVTKWidgetBase):
     def wheelEvent(self, event):
         camera = self.parent.renderer.GetActiveCamera()
         zoom_factor = 0.9 if event.angleDelta().y() < 0 else 1.1  # up=in, down=out on Mac
+        zoom_factor = 0.9 if event.angleDelta().y() < 0 else 1.1  # up=in, down=out on Mac
         camera.Dolly(zoom_factor)
         self.parent.renderer.ResetCameraClippingRange()
         self.parent.vtk_widget.GetRenderWindow().Render()
@@ -169,13 +197,16 @@ class CustomQVTKRenderWindowInteractor(QVTKWidgetBase):
             camera.Elevation(rotation_step)
         camera.OrthogonalizeViewUp()
         self.parent.renderer.ResetCameraClippingRange()
+        self.parent.renderer.ResetCameraClippingRange()
         self.parent.vtk_widget.GetRenderWindow().Render()
 
         if event.key() == Qt.Key_Plus or event.key() == Qt.Key_Equal:
             camera.Dolly(1.1)  # Zoom in
+            camera.Dolly(1.1)  # Zoom in
             self.parent.renderer.ResetCameraClippingRange()
             self.parent.vtk_widget.GetRenderWindow().Render()
         elif event.key() == Qt.Key_Minus or event.key() == Qt.Key_Underscore:
+            camera.Dolly(0.9)  # Zoom out
             camera.Dolly(0.9)  # Zoom out
             self.parent.renderer.ResetCameraClippingRange()
             self.parent.vtk_widget.GetRenderWindow().Render()
@@ -294,9 +325,11 @@ class ViewerApp(QMainWindow):
         self.setGeometry(100, 100, 800, 600) # Set initial window size
         self.current_lighting_preset = "studio"
         # Measurement state
+        # Measurement state
         self.measure_points = []  # Store measurement points
         self.measure_markers = [] # Store marker actors for measurements
         self.measure_lines = []   # Store line actors for measurements
+        self.measure_labels = []
         self.measure_labels = []
         self.measure_history = []
         self.undo_stack = []
@@ -350,11 +383,21 @@ class ViewerApp(QMainWindow):
 
         self.history_list = QListWidget()
         self.history_list.itemSelectionChanged.connect(self.update_measurement_highlight)
+        self.history_list.itemSelectionChanged.connect(self.update_measurement_highlight)
 
         # Create a widget to hold controls and history list
         history_widget = QWidget()
         history_layout = QVBoxLayout(history_widget)
         # Measurement control buttons
+        self.btn_start = QPushButton("Start Measuring")
+        self.btn_start.clicked.connect(self.activate_measure_mode)
+        history_layout.addWidget(self.btn_start)
+        self.btn_stop = QPushButton("Stop Measuring")
+        self.btn_stop.clicked.connect(self.cancel_measurement)
+        history_layout.addWidget(self.btn_stop)
+        self.btn_clear_last = QPushButton("Clear Last Measurement")
+        self.btn_clear_last.clicked.connect(self.clear_last_measurement)
+        history_layout.addWidget(self.btn_clear_last)
         self.btn_start = QPushButton("Start Measuring")
         self.btn_start.clicked.connect(self.activate_measure_mode)
         history_layout.addWidget(self.btn_start)
@@ -383,7 +426,17 @@ class ViewerApp(QMainWindow):
         self.history_dock = QDockWidget("Measurements", self)
         self.history_dock.setWidget(history_widget)
         self.history_dock.setFeatures(QDockWidget.DockWidgetMovable) # Only allow moving, not closing or floating
+        self.history_dock.setFeatures(QDockWidget.DockWidgetMovable) # Only allow moving, not closing or floating
         self.addDockWidget(Qt.LeftDockWidgetArea, self.history_dock)
+
+        # Model Info dock
+        self.info_text = QPlainTextEdit()
+        self.info_text.setReadOnly(True)
+        self.info_text.setStyleSheet("font-family: Menlo, monospace; font-size: 12px;")
+        self.info_dock = QDockWidget("Model Info", self)
+        self.info_dock.setWidget(self.info_text)
+        self.info_dock.setFeatures(QDockWidget.DockWidgetMovable)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.info_dock)
 
         # Model Info dock
         self.info_text = QPlainTextEdit()
@@ -403,9 +456,13 @@ class ViewerApp(QMainWindow):
         self.background_index = 2
         self.set_background_color(*self.background_colors[self.background_index])
 
+        self.background_index = 2
+        self.set_background_color(*self.background_colors[self.background_index])
+
         # Menu
         self.init_menu()
         # Load default model
+        default_model = "assets/house.obj"
         default_model = "assets/house.obj"
         if os.path.exists(default_model):
             self.load_model(default_model)
@@ -438,11 +495,34 @@ class ViewerApp(QMainWindow):
         zoom_in_action = QAction("Zoom In", self)
         zoom_in_action.setShortcut("Ctrl++")
         zoom_in_action.triggered.connect(lambda: self.zoom_camera(1.1))  # Zoom in
+        zoom_in_action.triggered.connect(lambda: self.zoom_camera(1.1))  # Zoom in
         view_menu.addAction(zoom_in_action)
         zoom_out_action = QAction("Zoom Out", self)
         zoom_out_action.setShortcut("Ctrl+-")
         zoom_out_action.triggered.connect(lambda: self.zoom_camera(0.9))  # Zoom out
+        zoom_out_action.triggered.connect(lambda: self.zoom_camera(0.9))  # Zoom out
         view_menu.addAction(zoom_out_action)
+        # Refresh model info action
+        refresh_info_action = QAction("Refresh Model Info", self)
+        refresh_info_action.setShortcut("I")
+        refresh_info_action.triggered.connect(self.update_model_info)
+        view_menu.addAction(refresh_info_action)
+
+        ########### MOUSE MENU ##############
+        mouse_menu = menubar.addMenu("Mouse")
+        act_trackball = QAction("Style: Trackball", self)
+        act_trackball.triggered.connect(lambda: self.set_mouse_style("trackball"))
+        mouse_menu.addAction(act_trackball)
+        act_terrain = QAction("Style: Terrain", self)
+        act_terrain.triggered.connect(lambda: self.set_mouse_style("terrain"))
+        mouse_menu.addAction(act_terrain)
+        act_joystick = QAction("Style: Joystick", self)
+        act_joystick.triggered.connect(lambda: self.set_mouse_style("joystick"))
+        mouse_menu.addAction(act_joystick)
+        act_cycle = QAction("Cycle Mouse Style", self)
+        act_cycle.setShortcut("M")
+        act_cycle.triggered.connect(self.cycle_mouse_style)
+        mouse_menu.addAction(act_cycle)
         # Refresh model info action
         refresh_info_action = QAction("Refresh Model Info", self)
         refresh_info_action.setShortcut("I")
@@ -731,6 +811,35 @@ class ViewerApp(QMainWindow):
         nxt = self.mouse_styles[(i + 1) % len(self.mouse_styles)]
         self.set_mouse_style(nxt)
 
+    def set_mouse_style(self, name: str):
+        """Set mouse interaction style: trackball | terrain | joystick."""
+        name = name.lower()
+        if name == "trackball":
+            # Reattach the switch, then select trackball
+            self.interactor.SetInteractorStyle(self.style_switch)
+            self.style_switch.SetCurrentStyleToTrackballCamera()
+        elif name == "joystick":
+            # Reattach the switch, then select joystick
+            self.interactor.SetInteractorStyle(self.style_switch)
+            self.style_switch.SetCurrentStyleToJoystickCamera()
+        elif name == "terrain":
+            # Not available via switch on this VTK; use terrain style directly
+            self.interactor.SetInteractorStyle(self._terrain_style)
+        else:
+            # Fallback to trackball
+            self.interactor.SetInteractorStyle(self.style_switch)
+            self.style_switch.SetCurrentStyleToTrackballCamera()
+            name = "trackball"
+
+        self.current_mouse_style = name
+        self.statusBar().showMessage(f"Mouse style: {name.capitalize()}")
+
+    def cycle_mouse_style(self):
+        """Cycle through available mouse styles."""
+        i = self.mouse_styles.index(self.current_mouse_style)
+        nxt = self.mouse_styles[(i + 1) % len(self.mouse_styles)]
+        self.set_mouse_style(nxt)
+
     def load_texture(self, texture_path):
         '''Load a texture from file and return a vtkTexture object'''
         reader_factory = vtk.vtkImageReader2Factory()
@@ -787,6 +896,8 @@ class ViewerApp(QMainWindow):
         self.renderer.AddActor(outline_actor)
         actor.GetProperty().SetPointSize(2)
         self.renderer.AddActor(actor)
+        self.update_model_info()
+        self.reset_view()
         self.update_model_info()
         self.reset_view()
 
@@ -864,12 +975,70 @@ class ViewerApp(QMainWindow):
         except Exception as e:
             self.info_text.setPlainText(f"Model Info\n-----------------------------\nError: {e}")
 
+    def update_model_info(self):
+        """Collect scene stats and show in the Model Info dock."""
+        try:
+            actors = self.renderer.GetActors()
+            actors.InitTraversal()
+            n_actors = actors.GetNumberOfItems()
+
+            total_points = 0
+            total_polys = 0
+            total_lines = 0
+            total_strips = 0
+            textured = 0
+
+            for _ in range(n_actors):
+                a = actors.GetNextActor()
+                if a is None:
+                    continue
+                mapper = a.GetMapper()
+                if mapper is None:
+                    continue
+                data = mapper.GetInput()
+                if isinstance(data, vtk.vtkPolyData):
+                    total_points += int(data.GetNumberOfPoints() or 0)
+                    total_polys  += int(data.GetNumberOfPolys() or 0)
+                    total_lines  += int(data.GetNumberOfLines() or 0)
+                    total_strips += int(data.GetNumberOfStrips() or 0)
+                if a.GetTexture() is not None:
+                    textured += 1
+
+            bounds = self.renderer.ComputeVisiblePropBounds()
+            bx = (bounds[0], bounds[1])
+            by = (bounds[2], bounds[3])
+            bz = (bounds[4], bounds[5])
+            sx = bx[1] - bx[0]
+            sy = by[1] - by[0]
+            sz = bz[1] - bz[0]
+
+            info = []
+            info.append("Model Info")
+            info.append("-----------------------------")
+            info.append(f"Actors:            {n_actors}")
+            info.append(f"Textured actors:   {textured}")
+            info.append("")
+            info.append(f"Points (vertices): {total_points}")
+            info.append(f"Polys (faces):     {total_polys}")
+            info.append(f"Lines:             {total_lines}")
+            info.append(f"Strips:            {total_strips}")
+            info.append("")
+            info.append(f"Bounds X: [{bx[0]:.3f}, {bx[1]:.3f}]  size: {sx:.3f}")
+            info.append(f"Bounds Y: [{by[0]:.3f}, {by[1]:.3f}]  size: {sy:.3f}")
+            info.append(f"Bounds Z: [{bz[0]:.3f}, {bz[1]:.3f}]  size: {sz:.3f}")
+
+            self.info_text.setPlainText("\n".join(info))
+            self.statusBar().showMessage("Model info refreshed.")
+        except Exception as e:
+            self.info_text.setPlainText(f"Model Info\n-----------------------------\nError: {e}")
+
 
     ############### MEASUREMENT METHODS #################
 
     def activate_measure_mode(self):
         '''Activate measurement mode to measure distances.'''
         self.deactivate_all_modes()  # Ensure no other mode is active
+        self.btn_start.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold;")
         self.btn_start.setStyleSheet("background-color: #0078d7; color: white; font-weight: bold;")
         self.statusBar().showMessage("Click points to measure. Right-click to finish.")
         self.left_click_observer = self.vtk_widget.AddObserver("LeftButtonPressEvent", self.on_measure_click)
@@ -885,9 +1054,12 @@ class ViewerApp(QMainWindow):
             del self.right_click_observer
         # Do NOT remove marker/line actors or clear lists here!
         # Do NOT clear measure_points here; keep indices consistent for deletion logic
+        # Do NOT clear measure_points here; keep indices consistent for deletion logic
         # Only clear temporary measurement points if needed:
         # self.measure_points.clear()
+        # self.measure_points.clear()
         self.statusBar().showMessage("Measurement cancelled.")
+        self.btn_start.setStyleSheet("")
         self.btn_start.setStyleSheet("")
 
     def on_measure_click(self, obj, event):
@@ -949,6 +1121,19 @@ class ViewerApp(QMainWindow):
                 self.renderer.AddActor(label)
                 self.measure_labels.append(label)
 
+
+                # Add distance label at the line midpoint
+                mx = 0.5 * (p1[0] + p2[0])
+                my = 0.5 * (p1[1] + p2[1])
+                mz = 0.5 * (p1[2] + p2[2])
+                label = vtk.vtkBillboardTextActor3D()
+                label.SetInput(f"{dist:.3f}")
+                label.SetPosition(mx, my, mz)
+                label.GetTextProperty().SetColor(1, 1, 0)  # yellow
+                label.GetTextProperty().SetFontSize(18)
+                self.renderer.AddActor(label)
+                self.measure_labels.append(label)
+
                 self.vtk_widget.GetRenderWindow().Render()
 
     def finish_measure(self, obj, event):
@@ -961,6 +1146,14 @@ class ViewerApp(QMainWindow):
             self.statusBar().showMessage(f"Measurement finished. Total path length: {total:.3f}")
         else:
             self.statusBar().showMessage("Measurement cancelled or not enough points.")
+        # Remove observers (guard with hasattr)
+        if hasattr(self, "left_click_observer"):
+            self.vtk_widget.RemoveObserver(self.left_click_observer)
+            del self.left_click_observer
+        if hasattr(self, "right_click_observer"):
+            self.vtk_widget.RemoveObserver(self.right_click_observer)
+            del self.right_click_observer
+        self.btn_start.setStyleSheet("")
         # Remove observers (guard with hasattr)
         if hasattr(self, "left_click_observer"):
             self.vtk_widget.RemoveObserver(self.left_click_observer)
@@ -997,6 +1190,12 @@ class ViewerApp(QMainWindow):
                 self.renderer.RemoveActor(actor)
             self.measure_labels.clear()
         # Clear points/history/stacks/UI
+        # Remove label actors
+        if hasattr(self, "measure_labels"):
+            for actor in list(self.measure_labels):
+                self.renderer.RemoveActor(actor)
+            self.measure_labels.clear()
+        # Clear points/history/stacks/UI
         if hasattr(self, "measure_points"):
             self.measure_points.clear()
         self.measure_history.clear()
@@ -1020,6 +1219,10 @@ class ViewerApp(QMainWindow):
         if hasattr(self, "measure_labels") and self.measure_labels:
             actor = self.measure_labels.pop()
             self.renderer.RemoveActor(actor)
+        # Remove last label
+        if hasattr(self, "measure_labels") and self.measure_labels:
+            actor = self.measure_labels.pop()
+            self.renderer.RemoveActor(actor)
         # Remove last point
         if hasattr(self, "measure_points") and self.measure_points:
             self.measure_points.pop()
@@ -1032,7 +1235,9 @@ class ViewerApp(QMainWindow):
         self.statusBar().showMessage("Last measurement cleared.")
 
 
+
     def delete_selected_measurement(self):
+        '''Delete selected measurement rows; remove correct actors; skip "Total" rows.'''
         '''Delete selected measurement rows; remove correct actors; skip "Total" rows.'''
         selected_items = self.history_list.selectedItems()
         if not selected_items:
@@ -1050,8 +1255,21 @@ class ViewerApp(QMainWindow):
                 row_to_seg[i] = seg_idx
                 seg_idx += 1
 
+        # Map rows -> segment index (skip "Total")
+        row_to_seg = {}
+        seg_idx = 0
+        for i in range(self.history_list.count()):
+            text = self.history_list.item(i).text()
+            if text.startswith("Total"):
+                row_to_seg[i] = None
+            else:
+                row_to_seg[i] = seg_idx
+                seg_idx += 1
+
         rows = sorted([self.history_list.row(item) for item in selected_items], reverse=True)
         for row in rows:
+            item = self.history_list.item(row)
+            text = item.text() if item else ""
             item = self.history_list.item(row)
             text = item.text() if item else ""
             self.history_list.takeItem(row)
@@ -1081,9 +1299,37 @@ class ViewerApp(QMainWindow):
                 del self.measure_markers[seg]
                 if seg < len(self.measure_points):
                     del self.measure_points[seg]
+
+            seg = row_to_seg.get(row, None)
+            if seg is None:
+                # Skip totals entirely; do not touch measure_history
+                continue
+
+            # Remove segment visuals
+            total_lines = len(self.measure_lines)
+            has_prev = (seg - 1) >= 0
+            has_next = (seg + 1) < total_lines
+            if seg < len(self.measure_lines):
+                self.renderer.RemoveActor(self.measure_lines[seg])
+                del self.measure_lines[seg]
+            if seg < len(self.measure_labels):
+                self.renderer.RemoveActor(self.measure_labels[seg])
+                del self.measure_labels[seg]
+            if (seg + 1) < len(self.measure_markers) and not has_next:
+                self.renderer.RemoveActor(self.measure_markers[seg + 1])
+                del self.measure_markers[seg + 1]
+                if (seg + 1) < len(self.measure_points):
+                    del self.measure_points[seg + 1]
+            if seg < len(self.measure_markers) and not has_prev:
+                self.renderer.RemoveActor(self.measure_markers[seg])
+                del self.measure_markers[seg]
+                if seg < len(self.measure_points):
+                    del self.measure_points[seg]
         self.vtk_widget.GetRenderWindow().Render()
         self.update_measurement_highlight()
+        self.update_measurement_highlight()
         self.statusBar().showMessage("Selected measurement(s) deleted.")
+
 
 
     def undo_measurement(self):
@@ -1104,6 +1350,8 @@ class ViewerApp(QMainWindow):
             if action == 'add':
                 self.measure_history.append(value)
                 self.undo_stack.append(('add', value))
+                # Keep list format consistent
+                self.history_list.addItem(f"Segment: {value:.3f}")
                 # Keep list format consistent
                 self.history_list.addItem(f"Segment: {value:.3f}")
                 self.statusBar().showMessage("Redo last measurement.")
@@ -1814,10 +2062,17 @@ class ViewerApp(QMainWindow):
     def load_model(self, filename):
         '''Load a 3D model from the specified file.'''
         # Clear current scene
+        # Clear current scene
         self.renderer.RemoveAllViewProps()
         ext = os.path.splitext(filename)[1].lower()
 
         try:
+
+            if ext == ".obj":
+                # Use VTK OBJ importer to load MTL/PNG textures correctly
+                self.load_obj_with_textures(filename)
+
+            elif ext in [".stl", ".ply"]:
 
             if ext == ".obj":
                 # Use VTK OBJ importer to load MTL/PNG textures correctly
@@ -1835,7 +2090,16 @@ class ViewerApp(QMainWindow):
                 normals.AutoOrientNormalsOn()
                 normals.Update()
 
+                # Compute normals for better lighting/shading
+                normals = vtk.vtkPolyDataNormals()
+                normals.SetInputData(polydata)
+                normals.SplittingOff()
+                normals.ConsistencyOn()
+                normals.AutoOrientNormalsOn()
+                normals.Update()
+
                 mapper = vtk.vtkPolyDataMapper()
+                mapper.SetInputConnection(normals.GetOutputPort())
                 mapper.SetInputConnection(normals.GetOutputPort())
                 actor = vtk.vtkActor()
                 actor.SetMapper(mapper)
@@ -1852,13 +2116,16 @@ class ViewerApp(QMainWindow):
 
             else:
                 self.statusBar().showMessage(f"Unsupported file format: {ext}")
+                self.statusBar().showMessage(f"Unsupported file format: {ext}")
                 print(f"Unsupported file format: {ext}")
                 return
 
             # Apply current lighting and finalize view
+            # Apply current lighting and finalize view
             self.apply_lighting_preset(self.current_lighting_preset)
             self.statusBar().showMessage(f"Loaded: {os.path.basename(filename)}")
             self.renderer.ResetCameraClippingRange()
+            self.update_model_info()
             self.update_model_info()
             self.vtk_widget.GetRenderWindow().Render()
 
