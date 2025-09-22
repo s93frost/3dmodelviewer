@@ -10,6 +10,8 @@ import shlex # For shell-like splitting of strings
 import shutil
 import unicodedata
 
+from typing import Optional
+
 # Third-party imports
 import vtk # VTK core
 import laspy # For LAS loading
@@ -314,6 +316,8 @@ class ViewerApp(QMainWindow):
         self.redo_stack = []
         self.annotations = []
 
+        self.debug_skip_obj_patching = False  # when True, load OBJ/MTL untouched
+
         # VTK widget
         self.vtk_widget = CustomQVTKRenderWindowInteractor(self)
         self.setCentralWidget(self.vtk_widget)
@@ -324,6 +328,19 @@ class ViewerApp(QMainWindow):
             ren_win = vtk.vtkGenericOpenGLRenderWindow()
             self.vtk_widget.SetRenderWindow(ren_win)
             self.renderer = vtk.vtkRenderer()
+            try:
+                if hasattr(self.renderer, "UseSrgbColorSpaceOn"):
+                    self.renderer.UseSrgbColorSpaceOn()
+            except Exception:
+                pass
+            if hasattr(self.renderer, "SetUseDepthPeeling"):
+                try:
+                    self.renderer.SetUseDepthPeeling(True)
+                    rw = self.vtk_widget.GetRenderWindow()
+                    rw.SetAlphaBitPlanes(1)
+                    rw.SetMultiSamples(0)
+                except Exception:
+                    pass
             ren_win.AddRenderer(self.renderer)
             # Interactor from the widget/render window
             self.interactor = self.vtk_widget.GetInteractor() or ren_win.GetInteractor()
@@ -341,6 +358,13 @@ class ViewerApp(QMainWindow):
                 pass
 
         self.vtk_widget.setFocus()
+
+        try:
+            if hasattr(self.renderer,"UseSrgbColorSpaceOn"):
+                self.renderer.UseSrgbColorSpaceOn()
+            elif hasattr(self.renderer,"SetUseSrgbColorSpace"):
+                self.renderer.SetUseSrgbColorSpace(True)
+        except: pass
 
 
         # Enable depth peeling
@@ -415,6 +439,7 @@ class ViewerApp(QMainWindow):
         ]
         self.background_index = 2
         self.set_background_color(*self.background_colors[self.background_index])
+        self.pixelated_textures = False
 
         # Menu
         self.init_menu()
@@ -423,11 +448,38 @@ class ViewerApp(QMainWindow):
         if os.path.exists(default_model):
             self.load_model(default_model)
 
-        #self.interactor.Initialize()
-
     def init_menu(self):
         '''Initialize the menu bar and actions.'''
         menubar = self.menuBar()
+
+        diag_menu = menubar.addMenu("Diagnostics")
+        act_base = QAction("Load OBJ Baseline (no rewrite)", self)
+        act_base.triggered.connect(lambda: self._prompt_baseline())
+        diag_menu.addAction(act_base)
+        act_dump = QAction("Dump Materials", self)
+        act_dump.triggered.connect(self.dump_materials)
+        diag_menu.addAction(act_dump)
+        act_pix = QAction("Pixelated Textures", self)
+        act_pix.setCheckable(True)
+        act_pix.setChecked(False)
+        act_pix.triggered.connect(self.toggle_pixelated_textures)
+        diag_menu.addAction(act_pix)
+
+        act_flat = QAction("Flat Shading", self)
+        act_flat.setCheckable(True)
+        act_flat.setChecked(False)
+        act_flat.triggered.connect(self.toggle_flat)
+        diag_menu.addAction(act_flat)
+
+        act_skip_patch = QAction("Toggle Skip OBJ Patching", self)
+        act_skip_patch.setCheckable(True)
+        act_skip_patch.setChecked(self.debug_skip_obj_patching)
+        def _toggle_skip():
+            self.debug_skip_obj_patching = not self.debug_skip_obj_patching
+            act_skip_patch.setChecked(self.debug_skip_obj_patching)
+            self.statusBar().showMessage(f"Skip OBJ patching: {'ON' if self.debug_skip_obj_patching else 'OFF'}")
+        act_skip_patch.triggered.connect(_toggle_skip)
+        diag_menu.addAction(act_skip_patch)
 
         ########### FILE MENU ##############
         file_menu = menubar.addMenu("File")
@@ -627,6 +679,97 @@ class ViewerApp(QMainWindow):
         dbg_force_mtl.triggered.connect(self.debug_force_mtl_colors)
         debug_menu.addAction(dbg_force_mtl)
 
+
+    def toggle_pixelated_textures(self, enabled: bool):
+        self.pixelated_textures = bool(enabled)
+        if not self.renderer:
+            return
+        acts = self.renderer.GetActors(); acts.InitTraversal()
+        for _ in range(acts.GetNumberOfItems()):
+            a = acts.GetNextActor()
+            if not a: continue
+            tex = a.GetTexture()
+            if not tex: continue
+            try:
+                if self.pixelated_textures:
+                    tex.InterpolateOff()
+                else:
+                    tex.InterpolateOn()
+            except Exception:
+                pass
+        self.vtk_widget.GetRenderWindow().Render()
+        self.statusBar().showMessage(f"Pixelated textures: {'ON' if self.pixelated_textures else 'OFF'}")
+
+    def _extract_map_files(self, mtl_path: str):
+        maps = []
+        if not mtl_path or not os.path.isfile(mtl_path):
+            return maps
+        try:
+            with open(mtl_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    ls = line.strip().lower()
+                    if ls.startswith(("map_kd ", "map_ka ")):
+                        parts = line.strip().split(None, 1)
+                        if len(parts) == 2:
+                            maps.append(parts[1].strip().strip('"').strip("'"))
+        except Exception:
+            pass
+        return maps
+
+    def _choose_texture_root(self, obj_path: str, mtl_path: str, maps: list[str]) -> str:
+        """
+        Heuristic:
+          - If all maps are simple basenames -> use folder of MTL.
+          - Else try: obj_dir, parent(obj_dir), project_root.
+          - Score each root by how many map files exist under it when joined.
+        """
+        obj_dir = os.path.dirname(obj_path)
+        mtl_dir = os.path.dirname(mtl_path) if mtl_path else obj_dir
+        if not maps:
+            return mtl_dir
+        # Check if all are simple
+        if all(os.sep not in m for m in maps):
+            return mtl_dir
+
+        roots = [obj_dir, os.path.dirname(obj_dir), os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))]
+        seen = []
+        for r in roots:
+            if r and r not in seen and os.path.isdir(r):
+                seen.append(r)
+
+        best_root = mtl_dir
+        best_hits = -1
+        for root in seen:
+            hits = 0
+            for m in maps:
+                cand = os.path.join(root, m)
+                if os.path.isfile(cand):
+                    hits += 1
+            if hits > best_hits:
+                best_hits = hits
+                best_root = root
+        print(f"[DBG] Texture root choice: {best_root} (hits={best_hits}/{len(maps)})")
+        return best_root
+
+    def _diagnose_maps(self, maps: list[str], tex_root: str):
+        print("[DBG] Map file resolution test:")
+        for m in maps[:20]:  # limit spam
+            cand = os.path.join(tex_root, m)
+            print(f"   {m} -> {'OK' if os.path.isfile(cand) else 'MISSING'}")
+
+    def toggle_flat(self, enabled: bool):
+        if not self.renderer: return
+        acts = self.renderer.GetActors(); acts.InitTraversal()
+        for _ in range(acts.GetNumberOfItems()):
+            a = acts.GetNextActor()
+            if not a: continue
+            p = a.GetProperty()
+            if enabled and hasattr(p,"SetInterpolationToFlat"):
+                p.SetInterpolationToFlat()
+            elif not enabled and hasattr(p,"SetInterpolationToPhong"):
+                p.SetInterpolationToPhong()
+        self.vtk_widget.GetRenderWindow().Render()
+        self.statusBar().showMessage(f"Flat shading: {'ON' if enabled else 'OFF'}")
 
     def toggle_ssao(self, enabled: bool):
         try:
@@ -1555,6 +1698,59 @@ class ViewerApp(QMainWindow):
 
     ###############  LOADING METHODS #################
 
+    def dump_materials(self):
+        if not self.renderer: return
+        acts = self.renderer.GetActors(); acts.InitTraversal()
+        i = 0
+        for _ in range(acts.GetNumberOfItems()):
+            a = acts.GetNextActor()
+            if not a: continue
+            p = a.GetProperty()
+            tex = a.GetTexture()
+            kd = p.GetColor()
+            spec = p.GetSpecular() if hasattr(p, "GetSpecular") else None
+            interp = ("PBR" if hasattr(p,"GetInterpolation") and p.GetInterpolation()==5
+                    else "Phong")
+            print(f"[MAT] {i} tex={'Y' if tex else 'N'} color={kd} spec={spec} mode={interp}")
+            if tex and hasattr(tex, "GetBlendingMode"):
+                try:
+                    print("      blendMode:", tex.GetBlendingMode())
+                except: pass
+            i += 1
+
+    def _prompt_baseline(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Baseline OBJ", "", "OBJ (*.obj)")
+        if path:
+            self.load_obj_baseline(path)
+
+
+    def load_obj_baseline(self, obj_path: str):
+        mtl = os.path.splitext(obj_path)[0] + ".mtl"
+        rw = self.vtk_widget.GetRenderWindow()
+        # Clear existing props only (keep renderer)
+        self.renderer.RemoveAllViewProps()
+        imp = vtk.vtkOBJImporter()
+        imp.SetRenderWindow(rw)
+        imp.SetFileName(obj_path)
+        if os.path.isfile(mtl):
+            imp.SetFileNameMTL(mtl)
+        # DO NOT call SetTexturePath
+        imp.Update()
+        # Use importer’s first renderer
+        rens = rw.GetRenderers(); rens.InitTraversal()
+        self.renderer = rens.GetNextItem()
+        self.renderer.ResetCamera()
+        rw.Render()
+        # Quick dump
+        acts = self.renderer.GetActors(); acts.InitTraversal()
+        i = 0; tex_cnt = 0
+        for _ in range(acts.GetNumberOfItems()):
+            a = acts.GetNextActor()
+            if not a: continue
+            if a.GetTexture(): tex_cnt += 1
+            i += 1
+        print(f"[BASE] actors={i} textured={tex_cnt}")
+
     def _find_mtl_and_texture_dir(self, obj_path: str):
         """Parse OBJ for mtllib and choose a sensible texture directory."""
         obj_dir = os.path.dirname(obj_path)
@@ -1685,59 +1881,8 @@ class ViewerApp(QMainWindow):
         return s or "tex.png"
 
     def _stage_textures(self, patched_mtl: str, texture_dir: str):
-        """
-        Copy all map_Kd textures into a local staging dir with sanitized names,
-        and rewrite the MTL to reference those staged files (no spaces, no quotes).
-        Returns (staged_mtl_path, staged_dir).
-        """
-        if not os.path.isfile(patched_mtl):
-            return patched_mtl, texture_dir
-
-        staged_dir = os.path.join(os.path.dirname(patched_mtl), "textures_staged")
-        os.makedirs(staged_dir, exist_ok=True)
-
-        with open(patched_mtl, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()
-
-        out_lines = []
-        for line in lines:
-            s = line.strip()
-            sl = s.lower()
-            if sl.startswith("map_kd "):
-                # Parse key + options + filename
-                toks = shlex.split(s)
-                opts = toks[1:-1] if len(toks) > 2 else []
-                tex_raw = toks[-1] if len(toks) >= 2 else ""
-                # If absolute path exists, use it; else resolve relative to texture_dir
-                src = tex_raw.strip().strip('"').strip("'")
-                if not os.path.isabs(src):
-                    cand = os.path.abspath(os.path.join(texture_dir, src))
-                    src = cand
-                if os.path.isfile(src):
-                    dst_name = self._sanitize_name(src)
-                    dst_path = os.path.join(staged_dir, dst_name)
-                    try:
-                        if not os.path.isfile(dst_path):
-                            shutil.copyfile(src, dst_path)
-                    except Exception as e:
-                        print(f"[MTL] Copy failed {src} -> {dst_path}: {e}")
-                        # Keep original line if copy fails
-                        out_lines.append(line)
-                        continue
-                    opt_str = (" " + " ".join(opts)) if opts else ""
-                    out_lines.append(f"map_Kd{opt_str} {dst_name}\n")
-                else:
-                    print(f"[MTL] Missing texture file: {src}")
-                    out_lines.append(f"# {line.strip()}  # missing/removed\n")
-            elif sl.startswith("map_ka ") or sl.startswith("map_d "):
-                out_lines.append(f"# {line.strip()}  # stripped to avoid override/darkening\n")
-            else:
-                out_lines.append(line)
-
-        staged_mtl = os.path.join(os.path.dirname(patched_mtl), "patched_staged.mtl")
-        with open(staged_mtl, "w", encoding="utf-8") as f:
-            f.write("".join(out_lines))
-        return staged_mtl, staged_dir
+        # No longer used (staging disabled). Return inputs unchanged.
+        return patched_mtl, texture_dir
 
 
     def _rewrite_obj_mtllib(self, obj_path: str, patched_mtl_path: str) -> str:
@@ -1874,85 +2019,60 @@ class ViewerApp(QMainWindow):
 
     def _rewrite_mtl(self, obj_path: str, mtl_path: str, texture_dir: str) -> str:
         """Patch MTL: fix map_Kd paths and add stubs for all used-but-undefined materials."""
+        """Minimal MTL patch: strip quotes, keep map_Kd/map_Ka as-is if file exists,
+        comment out map_d, leave everything else unchanged."""
         used = self._scan_obj_materials(obj_path)
         defined, _ = self._parse_mtl(mtl_path) if mtl_path else (set(), {})
-        out_lines = []
-        if mtl_path and os.path.isfile(mtl_path):
-            with open(mtl_path, "r", encoding="utf-8", errors="ignore") as f:
-                out_lines = f.readlines()
+        if not (mtl_path and os.path.isfile(mtl_path)):
+            return mtl_path or ""
 
-        # Fix map paths (support common maps)
-        replaced = {"map_kd": 0, "map_ka": 0, "map_d": 0, "map_ks": 0, "map_ke": 0, "bump": 0, "map_bump": 0}
-        missing_list = []
+        with open(mtl_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
 
-        # Canonical output keys with correct case
-        CANON = {
-             "map_kd": "map_Kd",
-             "map_ka": "map_Ka",
-             "map_d":  "map_d",
-             "map_ks": "map_Ks",
-             "map_ke": "map_Ke",
-             "bump":   "bump",
-             "map_bump": "map_Bump",
-         }
+        def file_exists(rel_or_abs: str) -> bool:
+            p = rel_or_abs.strip().strip('"').strip("'")
+            if os.path.isabs(p):
+                return os.path.isfile(p)
+            return os.path.isfile(os.path.join(texture_dir, p))
 
-        def rewrite_map(line_text: str, key_lower: str, idx: int):
-            '''Rewrite a texture map line in place.'''
-            toks = shlex.split(line_text)
-            opts = toks[1:-1] if len(toks) > 2 else []
-            tex_raw = toks[-1] if len(toks) >= 2 else ""
-            resolved = self._resolve_texture_file(tex_raw, texture_dir)
-            out_key = CANON.get(key_lower, key_lower)
-
-            # Strip ambient and opacity maps to avoid overriding/darkening
-            if key_lower in ("map_ka", "map_d"):
-                out_lines[idx] = f"# {line_text}  # stripped {key_lower} to avoid override/darkening\n"
-                return
-
-            if resolved:
-                abs_tex = resolved if os.path.isabs(resolved) else os.path.abspath(os.path.join(texture_dir, resolved))
-                opt_str = (" " + " ".join(opts)) if opts else ""
-                out_lines[idx] = f"{out_key}{opt_str} {abs_tex}\n"
-                if key_lower in replaced:
-                    replaced[key_lower] += 1
-            else:
-                out_lines[idx] = f"# {line_text}  # missing/removed\n"
-                missing_list.append(f"{key_lower}:{tex_raw}")
-
-        # Walk lines and rewrite supported maps
-        for i, line in enumerate(out_lines):
+        out = []
+        counts = {"map_Kd": 0, "map_Ka": 0}
+        for line in lines:
             s = line.strip()
             sl = s.lower()
-            if   sl.startswith("map_kd "):   rewrite_map(s, "map_kd", i)
-            elif sl.startswith("map_ka "):   rewrite_map(s, "map_ka", i)  # will be commented out
-            elif sl.startswith("map_d "):    rewrite_map(s, "map_d", i)   # will be commented out
-            elif sl.startswith("map_ks "):   rewrite_map(s, "map_ks", i)
-            elif sl.startswith("map_ke "):   rewrite_map(s, "map_ke", i)
-            elif sl.startswith("bump "):     rewrite_map(s, "bump", i)
-            elif sl.startswith("map_bump "): rewrite_map(s, "map_bump", i)
-
-
-        # Single concise summary
-        parts = []
-        for k in ("map_kd","map_ka","map_d","map_ks","map_ke","bump","map_bump"):
-            if replaced[k]:
-                parts.append(f"{CANON[k]}:{replaced[k]}")
-        if parts:
-            msg = "Patched " + ", ".join(parts) + " path(s) in MTL."
-            self.statusBar().showMessage(msg)
-            print(msg)
+            if sl.startswith("map_kd ") or sl.startswith("map_ka "):
+                key = "map_Kd" if sl.startswith("map_kd ") else "map_Ka"
+                parts = s.split(None, 1)
+                if len(parts) == 2:
+                    raw = parts[1].strip().strip('"').strip("'")
+                    if file_exists(raw):
+                        out.append(f"{key} {raw}\n")
+                        counts[key] += 1
+                    else:
+                        out.append(f"# {line.strip()}  # missing\n")
+                else:
+                    out.append(line)
+            elif sl.startswith("map_d "):
+                out.append(f"# {line.strip()}  # stripped opacity\n")
+            else:
+                out.append(line)
 
         # Add stubs for used-but-undefined materials
         missing = [m for m in used if m not in defined]
         if missing:
-            out_lines.append("\n# --- Auto-added stub materials ---\n")
+            out.append("\n# --- Auto-added stub materials ---\n")
             for name in missing:
-                out_lines.append(f"newmtl {name}\nKd 0.8 0.8 0.8\nKa 0 0 0\nKs 0 0 0\nNs 0\nillum 1\n")
+                out.append(f"newmtl {name}\nKd 0.8 0.8 0.8\nKa 0 0 0\nKs 0 0 0\nNs 0\nillum 1\n")
 
         tmp = tempfile.NamedTemporaryFile(prefix="patched_", suffix=".mtl", delete=False)
-        tmp.write("".join(out_lines).encode("utf-8"))
+        tmp.write("".join(out).encode("utf-8"))
         tmp.flush(); tmp.close()
+
+        summary = ", ".join(f"{k}:{v}" for k, v in counts.items() if v)
+        if summary:
+            print(f"[MTL] Patched {summary}")
         return tmp.name
+
 
 
     def load_obj_with_textures(self, obj_path: str):
@@ -1971,42 +2091,85 @@ class ViewerApp(QMainWindow):
                 yield acts.GetNextActor()
         actors_before_ids = {id(a) for a in iter_actors(self.renderer)}
 
-        mtl_path, texture_dir = self._find_mtl_and_texture_dir(obj_path)
-        # Detect MTL-only color case (no texture maps in MTL)
-        only_mtl_colors = self._mtl_has_any_maps(mtl_path) is False
-        if only_mtl_colors:
-            print("[OBJ] MTL-only colors detected (no map_* in MTL). Will still follow the menu toggle.")
+        mtl_path, texture_dir_guess = self._find_mtl_and_texture_dir(obj_path)
 
-        patched_mtl = self._rewrite_mtl(obj_path, mtl_path, texture_dir)
+        maps_raw = self._extract_map_files(mtl_path)
+        # Decide texture root BEFORE rewrite
+        chosen_root = self._choose_texture_root(obj_path, mtl_path, maps_raw)
+
+        patched_mtl = self._rewrite_mtl(obj_path, mtl_path, chosen_root)
         patched_obj = self._rewrite_obj_mtllib(obj_path, patched_mtl)
 
-        staged_mtl, staged_dir = self._stage_textures(patched_mtl, texture_dir)
-        # Re-point OBJ to staged MTL
-        patched_obj = self._rewrite_obj_mtllib(obj_path, staged_mtl)
-        print(f"[OBJ] Texture dir (staged): {os.path.abspath(staged_dir)}")
+        # Re-extract (patched may comment some out)
+        maps_after = self._extract_map_files(patched_mtl)
+        self._diagnose_maps(maps_after, chosen_root)
 
-        print(f"[OBJ] Texture dir: {os.path.abspath(texture_dir)}")
+        print(f"[OBJ] Texture dir candidate: {chosen_root}")
 
         importer = vtk.vtkOBJImporter()
         importer.SetRenderWindow(ren_win)
-        #importer.SetFileName(patched_obj)          # force use of our patched OBJ
-        #importer.SetFileNameMTL(patched_mtl)       # and our patched MTL
-        #importer.SetTexturePath(os.path.abspath(texture_dir))
-
         importer.SetFileName(patched_obj)
-        importer.SetFileNameMTL(staged_mtl)
-        importer.SetTexturePath(os.path.abspath(staged_dir))
+        importer.SetFileNameMTL(patched_mtl)
 
-        # Debug: renderer counts before import
-        rens = ren_win.GetRenderers(); rens.InitTraversal()
-        before_count = rens.GetNumberOfItems()
-        print(f"[OBJ] Renderers before import: {before_count}")
+        # Try strategy sequence
+        tried = []
+
+        def attempt_set(path_or_none, label):
+            if path_or_none is None:
+                print(f"[OBJ] Attempt (no texture path): {label}")
+            else:
+                print(f"[OBJ] Attempt texture path='{path_or_none}': {label}")
+                importer.SetTexturePath(path_or_none)
+            try:
+                importer.Update()
+                return True
+            except Exception as e:
+                print(f"[OBJ] Import attempt failed ({label}): {e}")
+                return False
+
+        # First attempt: no texture path if maps include subfolders
+        success = False
+        if any(os.sep in m for m in maps_after):
+            success = attempt_set(None, "raw subfolder paths")
+        if not success:
+            success = attempt_set(chosen_root, "chosen_root")
+        if not success and chosen_root != texture_dir_guess:
+            success = attempt_set(texture_dir_guess, "mtl_dir_guess")
+        if not success:
+            # Last fallback: obj_dir
+            success = attempt_set(os.path.dirname(obj_path), "obj_dir")
+
+        if not success:
+            self.statusBar().showMessage("Failed to import OBJ with textures.")
+            return
 
         try:
             importer.Update()
+            acts = self.renderer.GetActors(); acts.InitTraversal()
+            idx = 0
+            while idx < acts.GetNumberOfItems():
+                a = acts.GetNextActor()
+                if a:
+                    print(f"[CHK] Actor {idx} texture? {bool(a.GetTexture())}")
+                idx += 1
         except Exception as e:
             self.statusBar().showMessage(f"Failed to import OBJ: {e}")
             return
+
+
+        print("[CHK] Verifying bound textures after import:")
+        acts_tmp = self.renderer.GetActors(); acts_tmp.InitTraversal()
+        idx = 0
+        for _ in range(acts_tmp.GetNumberOfItems()):
+            a = acts_tmp.GetNextActor()
+            if not a: continue
+            t = a.GetTexture()
+            if t:
+                img = t.GetInput()
+                dims = img.GetDimensions() if img else None
+                print(f"  Actor {idx}: texture set, dims={dims}")
+            idx += 1
+
 
         # Debug: renderer counts after import
         rens = ren_win.GetRenderers(); rens.InitTraversal()
@@ -2050,88 +2213,95 @@ class ViewerApp(QMainWindow):
                 has_cell_scalars = bool(cs) and (cs.GetNumberOfTuples() or 0) > 0
 
             tex = a.GetTexture()
-            # Global or automatic ignore
-            effective_ignore = self.ignore_textures  # menu controls it
-
-            # Cache original material color once
+            effective_ignore = self.ignore_textures
             p = a.GetProperty()
             aid = id(a)
             if aid not in self._actor_orig_color:
-                try:
-                    self._actor_orig_color[aid] = tuple(p.GetColor())
-                except Exception:
-                    self._actor_orig_color[aid] = (1.0, 1.0, 1.0)
-
+                self._actor_orig_color[aid] = tuple(p.GetColor())
 
             if effective_ignore:
-                if tex is not None:
-                    a.SetTexture(None)
+                if tex: a.SetTexture(None)
                 mapper.ScalarVisibilityOff()
-                # Restore original MTL Kd color
-                orig = self._actor_orig_color.get(aid, (1.0, 1.0, 1.0))
-                p.SetColor(*orig)
-                # Compute normals if missing
+                orig = self._actor_orig_color.get(aid)
+                if orig: p.SetColor(*orig)
                 if not has_normals and isinstance(pd, vtk.vtkPolyData):
-                    in_conn = mapper.GetInputConnection(0, 0)
                     normals = vtk.vtkPolyDataNormals()
-                    if in_conn is not None: normals.SetInputConnection(in_conn)
-                    else: normals.SetInputData(pd)
+                    in_conn = mapper.GetInputConnection(0, 0)
+                    (normals.SetInputConnection(in_conn) if in_conn else normals.SetInputData(pd))
                     normals.SplittingOn(); normals.SetFeatureAngle(50.0)
                     normals.ConsistencyOn(); normals.AutoOrientNormalsOn()
                     normals.ComputePointNormalsOn()
                     mapper.SetInputConnection(normals.GetOutputPort())
-
             else:
-                # Prefer textures when UVs exist
-                if tex is not None and has_tcoords:
+                if tex and has_tcoords:
+
+                    # Alpha / cutout support (map_d or RGBA)
+                    # Enable depth peeling / blending already set at renderer level if available
+                    if hasattr(tex, "GetInput"):
+                        img = tex.GetInput()
+                        if img and img.GetNumberOfScalarComponents() == 4:
+                            # Force use of alpha channel if supported
+                            if hasattr(tex, "SetPremultipliedAlpha"):
+                                tex.SetPremultipliedAlpha(True)
+                            p.SetOpacity(1.0)
+                    # If pixelated mode currently ON apply now
+                    try:
+                        if self.pixelated_textures:
+                            tex.InterpolateOff()
+                        else:
+                            tex.InterpolateOn()
+                    except Exception:
+                        pass
+
                     try: tex.InterpolateOn(); tex.MipmapOn()
-                    except Exception: pass
+                    except: pass
                     try: tex.RepeatOff(); tex.EdgeClampOn()
-                    except Exception: pass
+                    except: pass
                     if hasattr(tex, "SetAnisotropicDegree"): tex.SetAnisotropicDegree(16)
-                    can_replace = hasattr(vtk.vtkTexture, "VTK_TEXTURE_BLENDING_MODE_REPLACE") and hasattr(tex, "SetBlendingMode")
+                    can_replace = (hasattr(vtk.vtkTexture,"VTK_TEXTURE_BLENDING_MODE_REPLACE")
+                                   and hasattr(tex,"SetBlendingMode"))
                     if can_replace:
                         tex.SetBlendingMode(vtk.vtkTexture.VTK_TEXTURE_BLENDING_MODE_REPLACE)
-                        # Keep original Kd when REPLACE is available
-                        orig = self._actor_orig_color.get(aid, (1.0, 1.0, 1.0))
-                        p.SetColor(*orig)
+                        # restore original Kd if stored
+                        orig = self._actor_orig_color.get(aid)
+                        if orig: p.SetColor(*orig)
                     else:
-                        # Fall back to white so MODULATE doesn't darken the texture
-                        p.SetColor(1.0, 1.0, 1.0)
+                        # only force white if very dark (avoid black modulation)
+                        if max(p.GetColor()) < 0.25:
+                            p.SetColor(1,1,1)
                     if hasattr(tex, "SetPremultipliedAlpha"): tex.SetPremultipliedAlpha(True)
                     if hasattr(tex, "SetUseSRGBColorSpace"): tex.SetUseSRGBColorSpace(True)
                     mapper.ScalarVisibilityOff()
-
                 else:
-                    if tex is not None and not has_tcoords:
+                    if tex and not has_tcoords:
                         a.SetTexture(None)
                     if has_pt_scalars or has_cell_scalars:
                         mapper.ScalarVisibilityOn()
-                        if has_pt_scalars and hasattr(mapper, "SetScalarModeToUsePointData"):
+                        if has_pt_scalars and hasattr(mapper,"SetScalarModeToUsePointData"):
                             mapper.SetScalarModeToUsePointData()
-                        elif has_cell_scalars and hasattr(mapper, "SetScalarModeToUseCellData"):
+                        elif has_cell_scalars and hasattr(mapper,"SetScalarModeToUseCellData"):
                             mapper.SetScalarModeToUseCellData()
-                        if hasattr(mapper, "SetColorModeToDirectScalars"):
+                        if hasattr(mapper,"SetColorModeToDirectScalars"):
                             mapper.SetColorModeToDirectScalars()
                     else:
                         mapper.ScalarVisibilityOff()
                     if not has_normals and isinstance(pd, vtk.vtkPolyData):
-                        in_conn = mapper.GetInputConnection(0, 0)
                         normals = vtk.vtkPolyDataNormals()
-                        if in_conn is not None: normals.SetInputConnection(in_conn)
-                        else: normals.SetInputData(pd)
+                        in_conn = mapper.GetInputConnection(0, 0)
+                        (normals.SetInputConnection(in_conn) if in_conn else normals.SetInputData(pd))
                         normals.SplittingOn(); normals.SetFeatureAngle(50.0)
                         normals.ConsistencyOn(); normals.AutoOrientNormalsOn()
                         normals.ComputePointNormalsOn()
                         mapper.SetInputConnection(normals.GetOutputPort())
+                    
+                # Apply mild ambient only once (do not flatten)
+                if hasattr(p,"SetAmbient") and hasattr(p,"SetDiffuse"):
+                    p.SetAmbient(0.25); p.SetDiffuse(0.75)
+                p.SetLighting(True)
+                p.BackfaceCullingOff(); p.FrontfaceCullingOff()
+                if hasattr(p,"SetInterpolationToPhong"):
+                    p.SetInterpolationToPhong()
 
-            # Reasonable material defaults; keep MTL Kd (don’t force white)
-            p = a.GetProperty()
-            p.SetLighting(True)
-            p.BackfaceCullingOff()
-            p.FrontfaceCullingOff()
-            if hasattr(p, "SetInterpolationToPhong"):
-                p.SetInterpolationToPhong()
 
         moved_actors = 0
         # Case 1: importer created separate renderers; move and configure actors
@@ -2188,17 +2358,29 @@ class ViewerApp(QMainWindow):
         final_count = rens.GetNumberOfItems()
         print(f"[OBJ] Renderers after cleanup: {final_count}")
 
-        # Cleanup temp files
-        for tmpf in [patched_obj, patched_mtl]:
-            try:
-                if tmpf and os.path.exists(tmpf):
-                    os.remove(tmpf)
-            except Exception:
-                pass
-
         self.renderer.ResetCamera()
         self.renderer.ResetCameraClippingRange()
         ren_win.Render()
+
+
+        '''
+        for tmpf in [patched_obj, patched_mtl, staged_mtl]:
+            try:
+                if tmpf and os.path.exists(tmpf):
+                    os.remove(tmpf)
+            except:
+                pass
+
+        staged_dir_path = os.path.abspath(staged_dir)
+        try:
+            if os.path.isdir(staged_dir_path):
+                # Remove only if you don’t want to inspect staged textures
+                shutil.rmtree(staged_dir_path)
+        except Exception as e:
+            print(f"[OBJ] Staging cleanup failed: {e}")
+        '''
+
+
         self.statusBar().showMessage("OBJ loaded with patched materials.")
 
     ######################## LOAD MODEL METHOD ###########################
@@ -2210,6 +2392,14 @@ class ViewerApp(QMainWindow):
 
         try:
             if ext == ".obj":
+
+                if self.debug_skip_obj_patching:
+                    self.load_obj_baseline(filename)
+                else:
+                    self.load_obj_with_textures(filename)
+                return
+
+                
                 # Prefer trimesh path if OBJ has per-vertex colors
                 if self._obj_has_vertex_colors(filename):
                     self.load_obj_colors_via_trimesh(filename)
