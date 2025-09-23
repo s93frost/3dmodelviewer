@@ -7,7 +7,7 @@ import vtk
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QAction, QFileDialog, QDockWidget,
-    QPlainTextEdit
+    QPlainTextEdit, QActionGroup
 )
 
 import vtkmodules.vtkIOImage  # ensure PNG/JPG readers are registered
@@ -27,14 +27,6 @@ class ViewerApp(QMainWindow):
         self.unlit = False
         self._shared_texture = None
         self.transparency_mode = "opaque"  # opaque | cutout | blend
-        # Enable better alpha (safe if no alpha textures)
-        try:
-            self.ren_win.SetAlphaBitPlanes(1)
-            self.ren_win.SetMultiSamples(0)
-            if hasattr(self.renderer, "SetUseDepthPeeling"):
-                self.renderer.SetUseDepthPeeling(True)
-        except:
-            pass
 
         # Central VTK widget
         from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
@@ -54,6 +46,14 @@ class ViewerApp(QMainWindow):
         self.ren_win.AddRenderer(self.renderer)
         self.iren = self.vtk_widget.GetRenderWindow().GetInteractor()
         self.vtk_widget.Initialize()
+
+        try:
+            self.ren_win.SetAlphaBitPlanes(1)
+            self.ren_win.SetMultiSamples(0)
+            if hasattr(self.renderer, "SetUseDepthPeeling"):
+                self.renderer.SetUseDepthPeeling(True)
+        except:
+            pass
 
         # Simple state
         self.bg_colors = [(1,1,1),(0.9,0.9,0.9),(0.2,0.2,0.2),(0,0,0)]
@@ -217,16 +217,15 @@ class ViewerApp(QMainWindow):
 
         # Transparency menu
         tmenu = mb.addMenu("Transparency")
+        group = QActionGroup(self); group.setExclusive(True)
         for mode in ("opaque","cutout","blend"):
             act = QAction(mode.capitalize(), self)
             act.setCheckable(True)
             act.setData(mode)
             if mode == self.transparency_mode:
                 act.setChecked(True)
-            def handler(checked, m=mode):
-                if checked:
-                    self.set_transparency_mode(m)
-            act.triggered.connect(handler)
+            act.triggered.connect(lambda checked, m=mode: checked and self.set_transparency_mode(m))
+            group.addAction(act)
             tmenu.addAction(act)
 
         # Brightness menu
@@ -395,11 +394,22 @@ class ViewerApp(QMainWindow):
     def load_model(self, filename: str):
         ''' Load a 3D model from file. '''
         self.renderer.RemoveAllViewProps()
+        self._shared_texture = None  # reset cached texture
         self.current_file = filename
         ext = os.path.splitext(filename)[1].lower()
+
         try:
+            '''
             if ext == ".obj":
                 self._load_obj(filename)
+                
+            '''
+            if ext == ".obj":
+                actors = self._load_obj_manual(filename)
+                for a in actors:
+                    self.renderer.AddActor(a)
+                self._apply_manual_atlas(filename, os.path.splitext(filename)[0] + ".mtl")
+
             elif ext in (".stl", ".ply"):
                 self._load_mesh_simple(filename)
             else:
@@ -503,10 +513,13 @@ class ViewerApp(QMainWindow):
                 p.SetAmbient(0.50); p.SetDiffuse(0.85); p.SetSpecular(0.05)
             if self.transparency_mode != "blend":
                 p.SetOpacity(1.0)
+        
+        self.apply_brightness()
+
         print(f"[TEX] Atlas applied (shared) to {replaced} actors.")
         self.ren_win.Render()
 
-
+    '''
     def _load_obj(self, obj_path: str):
         """Try vtkOBJImporter; if UVs degenerate, fallback to manual parser with proper TCoords."""
         mtl_path = os.path.splitext(obj_path)[0] + ".mtl"
@@ -585,6 +598,7 @@ class ViewerApp(QMainWindow):
             cx=(b[0]+b[1])/2; cy=(b[2]+b[3])/2; cz=(b[4]+b[5])/2
             cam.SetFocalPoint(cx,cy,cz)
         self.ren_win.Render()
+        '''
 
     def _load_mesh_simple(self, path: str):
         ''' Load STL or PLY using trimesh if available, else VTK reader. '''
@@ -667,6 +681,11 @@ class ViewerApp(QMainWindow):
     def _load_obj_manual(self, obj_path: str):
         """Minimal OBJ parser supporting v, vt, f (tri or n-gon), ignoring normals & materials.
            Builds unique (v,vt) pairs so texture coordinates map correctly."""
+        
+        if not os.path.isfile(obj_path):
+            print(f"[OBJ-MANUAL] File not found: {obj_path}")
+            return []
+
         verts = []
         uvs = []
         current_mat = "default"
@@ -742,6 +761,17 @@ class ViewerApp(QMainWindow):
             poly.GetPointData().SetTCoords(tcoords)
 
             mapper = vtk.vtkPolyDataMapper()
+
+            if not self.unlit:
+                nf = vtk.vtkPolyDataNormals()
+                nf.SetInputData(poly)
+                nf.AutoOrientNormalsOn()
+                nf.SplittingOff()
+                nf.Update()
+                mapper.SetInputConnection(nf.GetOutputPort())
+            else:
+                mapper.SetInputData(poly)
+
             mapper.SetInputData(poly)
             mapper.ScalarVisibilityOff()
             actor = vtk.vtkActor()
@@ -779,8 +809,37 @@ class ViewerApp(QMainWindow):
         self.ren_win.Render()
 
     def reset_view(self):
-        ''' Reset camera to fit the model. '''
-        self.renderer.ResetCamera()
+        '''Robust reset: frame all visible props and position camera back.'''
+        acts = self.renderer.GetActors(); acts.InitTraversal()
+        if acts.GetNumberOfItems() == 0:
+            return
+        bounds = self.renderer.ComputeVisiblePropBounds()
+        # bounds = (xmin,xmax,ymin,ymax,zmin,zmax)
+        if not bounds or all(v == 0 for v in bounds):
+            return
+        xmin,xmax,ymin,ymax,zmin,zmax = bounds
+        cx = (xmin + xmax) * 0.5
+        cy = (ymin + ymax) * 0.5
+        cz = (zmin + zmax) * 0.5
+        span_x = max(1e-6, xmax - xmin)
+        span_y = max(1e-6, ymax - ymin)
+        span_z = max(1e-6, zmax - zmin)
+        max_span = max(span_x, span_y, span_z)
+
+        cam = self.renderer.GetActiveCamera()
+        # View direction (diagonally down to give depth)
+        vx, vy, vz = (1.0, 0.8, 1.0)
+        # Normalize
+        mag = (vx*vx + vy*vy + vz*vz) ** 0.5
+        vx /= mag; vy /= mag; vz /= mag
+
+        dist = max_span * 2.2
+        cam.SetFocalPoint(cx, cy, cz)
+        cam.SetPosition(cx + vx * dist, cy + vy * dist, cz + vz * dist)
+        cam.SetViewUp(0, 1, 0)
+        cam.SetClippingRange(dist * 0.01, dist * 10.0)
+
+        # Also call VTK's own reset to adjust dolly heuristics (safe)
         self.renderer.ResetCameraClippingRange()
         self.ren_win.Render()
 
