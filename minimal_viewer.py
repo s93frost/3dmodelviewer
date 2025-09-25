@@ -4,11 +4,13 @@ import os
 from typing import Optional
 
 import vtk
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSize
 from PyQt5.QtWidgets import (
     QMainWindow, QApplication, QAction, QFileDialog, QDockWidget,
-    QPlainTextEdit, QActionGroup
+    QPlainTextEdit, QActionGroup, QToolBar, QStyle
 )
+
+from PyQt5.QtGui import QKeySequence
 
 import vtkmodules.vtkIOImage  # ensure PNG/JPG readers are registered
 
@@ -29,6 +31,9 @@ class ViewerApp(QMainWindow):
         self.transparency_mode = "opaque"  # opaque | cutout | blend
         # Transform applied to the whole model (all actors)
         self.model_transform = vtk.vtkTransform()
+        # Per-actor material and texture cache
+        self._actor_material = {}
+        self._texture_cache = {}
 
         # Central VTK widget
         from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
@@ -49,6 +54,7 @@ class ViewerApp(QMainWindow):
         self.iren = self.vtk_widget.GetRenderWindow().GetInteractor()
         self.vtk_widget.Initialize()
 
+
          # Mouse styles
         self.mouse_styles = ["trackball", "terrain", "joystick"]
         self.mouse_style = "trackball"
@@ -59,7 +65,7 @@ class ViewerApp(QMainWindow):
             self.ren_win.SetAlphaBitPlanes(1)
             self.ren_win.SetMultiSamples(0)
             if hasattr(self.renderer, "SetUseDepthPeeling"):
-                self.renderer.SetUseDepthPeeling(True)
+                self.renderer.SetUseDepthPeeling(False)  # enable later only for blend
         except:
             pass
 
@@ -71,6 +77,7 @@ class ViewerApp(QMainWindow):
 
         # UI
         self._init_menu()
+        self._init_toolbar()
         self._init_info_dock()
 
         # Lighting + initial background
@@ -83,6 +90,65 @@ class ViewerApp(QMainWindow):
             self.load_model(default_obj)
 
         self._bind_debug_keys()
+
+
+    def _init_toolbar(self):
+        """Create a slim top toolbar with icon-only actions."""
+        tb = QToolBar("Main", self)
+        tb.setIconSize(QSize(18, 18))
+        tb.setMovable(False)
+        tb.setFloatable(False)
+        tb.setAllowedAreas(Qt.TopToolBarArea)
+        tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.addToolBar(Qt.TopToolBarArea, tb)
+
+        st = self.style()
+        # File actions
+        act_open = QAction(st.standardIcon(QStyle.SP_DialogOpenButton), "Open", self)
+        act_open.setToolTip("Open model")
+        act_open.triggered.connect(self.open_file)
+        tb.addAction(act_open)
+
+        act_save = QAction(st.standardIcon(QStyle.SP_DialogSaveButton), "Save As", self)
+        act_save.setToolTip("Save model as OBJ")
+        act_save.triggered.connect(self.save_model_as)
+        tb.addAction(act_save)
+
+        tb.addSeparator()
+        # View controls
+        act_reset = QAction(st.standardIcon(QStyle.SP_BrowserReload), "Reset View", self)
+        act_reset.setToolTip("Reset view")
+        act_reset.triggered.connect(self.reset_view)
+        tb.addAction(act_reset)
+
+        act_wire = QAction(st.standardIcon(QStyle.SP_TitleBarShadeButton), "Wireframe", self)
+        act_wire.setToolTip("Toggle wireframe")
+        act_wire.triggered.connect(self.toggle_wireframe)
+        tb.addAction(act_wire)
+
+        act_bg = QAction(st.standardIcon(QStyle.SP_DesktopIcon), "Background", self)
+        act_bg.setToolTip("Cycle background")
+        act_bg.triggered.connect(self.cycle_background)
+        tb.addAction(act_bg)
+
+        tb.addSeparator()
+        # Zoom controls
+        act_zoomin = QAction(st.standardIcon(QStyle.SP_ArrowUp), "Zoom In", self)
+        act_zoomin.setToolTip("Zoom in")
+        act_zoomin.triggered.connect(lambda: self.zoom(+1, fast=False))
+        tb.addAction(act_zoomin)
+
+        act_zoomout = QAction(st.standardIcon(QStyle.SP_ArrowDown), "Zoom Out", self)
+        act_zoomout.setToolTip("Zoom out")
+        act_zoomout.triggered.connect(lambda: self.zoom(-1, fast=False))
+        tb.addAction(act_zoomout)
+
+        tb.addSeparator()
+        # Unlit toggle
+        self.act_unlit.setIcon(st.standardIcon(QStyle.SP_DialogNoButton))
+        self.act_unlit.setText("Unlit")
+        self.act_unlit.setToolTip("Toggle unlit (fullbright) textures")
+        tb.addAction(self.act_unlit)
 
 
     def dump_actor_textures(self):
@@ -109,11 +175,19 @@ class ViewerApp(QMainWindow):
             return
         self.transparency_mode = mode
         print(f"[ALPHA] mode -> {mode}")
-        # Rebuild shared texture (invalidate)
+        try:
+            if hasattr(self.renderer, "SetUseDepthPeeling"):
+                self.renderer.SetUseDepthPeeling(mode == "blend")
+        except:
+            pass
+        
+        # Invalidate caches and reapply textures
         self._shared_texture = None
+        self._texture_cache.clear()
         if self.current_file and self.current_file.lower().endswith(".obj"):
-            # Reapply atlas only (no geometry reload)
-            self._apply_manual_atlas(self.current_file, os.path.splitext(self.current_file)[0] + ".mtl")
+            mtl_path = os.path.splitext(self.current_file)[0] + ".mtl"
+            if not self._apply_textures_from_mtl(self.current_file, mtl_path):
+                self._apply_manual_atlas(self.current_file, mtl_path)
         self.ren_win.Render()
 
 
@@ -152,7 +226,6 @@ class ViewerApp(QMainWindow):
                     if scalars:
                         # crude check: sample middle pixel alpha
                         midx = dims[0]//2; midy = dims[1]//2
-                        idx = (midy * dims[0] + midx) * comps + (comps-1)
                         # GetArray pointer: safer to use GetTuple
                         alpha_val = scalars.GetTuple((midy * dims[0] + midx))[comps-1]
                         alpha_channel_nonzero = alpha_val > 0
@@ -204,7 +277,7 @@ class ViewerApp(QMainWindow):
         fmenu.addAction(act_open)
 
         act_save = QAction("Save Model As...", self)
-        act_save.setShortcut("Ctrl+Shift+S")
+        act_save.setShortcut(QKeySequence.SaveAs)
         act_save.triggered.connect(self.save_model_as)
         fmenu.addAction(act_save)
 
@@ -213,10 +286,11 @@ class ViewerApp(QMainWindow):
         act_reset.triggered.connect(self.reset_view)
         vmenu.addAction(act_reset)
 
-        act_unlit = QAction("Unlit Textures", self)
-        act_unlit.setCheckable(True)
-        act_unlit.triggered.connect(self.toggle_unlit)
-        vmenu.addAction(act_unlit)
+        self.act_unlit = QAction("Unlit Textures", self)
+        self.act_unlit.setCheckable(True)
+        self.act_unlit.setChecked(self.unlit)
+        self.act_unlit.triggered.connect(self.toggle_unlit)
+        vmenu.addAction(self.act_unlit)
 
         act_bg = QAction("Cycle Background (B)", self)
         act_bg.setShortcut("B")
@@ -254,8 +328,10 @@ class ViewerApp(QMainWindow):
 
         # Brightness menu
         bmenu = mb.addMenu("Brightness")
-        act_norm = QAction("Normal", self); act_norm.setCheckable(True)
-        act_bright = QAction("Bright", self); act_bright.setCheckable(True)
+        act_norm = QAction("Normal", self)
+        act_norm.setCheckable(True)
+        act_bright = QAction("Bright", self)
+        act_bright.setCheckable(True)
         act_norm.setChecked(self.brightness_mode == "normal")
         act_bright.setChecked(self.brightness_mode == "bright")
         def set_brightness(mode):
@@ -267,7 +343,8 @@ class ViewerApp(QMainWindow):
             return fn
         act_norm.triggered.connect(set_brightness("normal"))
         act_bright.triggered.connect(set_brightness("bright"))
-        bmenu.addAction(act_norm); bmenu.addAction(act_bright)
+        bmenu.addAction(act_norm)
+        bmenu.addAction(act_bright)
 
         # Lighting menu
         lmenu = mb.addMenu("Lighting")
@@ -300,7 +377,7 @@ class ViewerApp(QMainWindow):
             return
 
         # Movement step (Shift = x5)
-        if key in ('left','right','up','down','page_up','page_down'):
+        if key in ('left','right','up','down','prior','next'):  # prior=PageUp, next=PageDown
             fast = bool(self.iren.GetShiftKey())
             step = self._move_step(fast=fast)
             dx = dy = dz = 0.0
@@ -308,8 +385,8 @@ class ViewerApp(QMainWindow):
             if key == 'right': dx = +step
             if key == 'up':    dy = +step
             if key == 'down':  dy = -step
-            if key == 'page_up':   dz = +step
-            if key == 'page_down': dz = -step
+            if key == 'prior':     dz = +step
+            if key == 'next':      dz = -step
             self.nudge_model(dx, dy, dz)
             return
 
@@ -323,7 +400,7 @@ class ViewerApp(QMainWindow):
             self.diagnose_textures()
 
     def save_model_as(self):
-        # Export current scene to Wavefront OBJ (+ MTL + textures)
+        ''' Export current scene to Wavefront OBJ (+ MTL + textures). '''
         if not self.renderer or self.renderer.GetActors().GetNumberOfItems() == 0:
             self.statusBar().showMessage("Nothing to save")
             return
@@ -351,46 +428,37 @@ class ViewerApp(QMainWindow):
         ''' Bind debug key events. '''
         self.iren.AddObserver("KeyPressEvent", self._on_key)
 
+
     def _process_alpha(self, img: vtk.vtkImageData):
         ''' Process image alpha channel according to transparency_mode.'''
-        # Apply transparency_mode in-place; returns processed image (possibly new)
         if not img or img.GetNumberOfScalarComponents() < 4:
             return img
         mode = self.transparency_mode
         if mode == "blend":
-            return img  # keep as-is
-        # Extract RGBA -> work on alpha
+            return img
+        if mode == "opaque":
+            rgb_extract = vtk.vtkImageExtractComponents()
+            rgb_extract.SetInputData(img)
+            rgb_extract.SetComponents(0,1,2)
+            rgb_extract.Update()
+            return rgb_extract.GetOutput()
+        # cutout: binary mask >128 -> 255 else 0
         alpha_extract = vtk.vtkImageExtractComponents()
         alpha_extract.SetInputData(img)
-        alpha_extract.SetComponents(3)  # alpha channel (0,1,2,3)
+        alpha_extract.SetComponents(3)
         alpha_extract.Update()
         alpha = alpha_extract.GetOutput()
-
-        if mode == "opaque":
-            # Set all alpha=255
-            thresh = vtk.vtkImageThreshold()
-            thresh.SetInputData(alpha)
-            thresh.ThresholdByLower(-1)  # pass all
-            thresh.SetInValue(255)
-            thresh.SetOutValue(255)
-            thresh.Update()
-            alpha_processed = thresh.GetOutput()
-        else:  # cutout
-            # Threshold: >128 -> 255 else 0
-            thresh = vtk.vtkImageThreshold()
-            thresh.SetInputData(alpha)
-            thresh.ThresholdByUpper(128)
-            thresh.ReplaceInOn();  thresh.SetInValue(0)
-            thresh.ReplaceOutOn(); thresh.SetOutValue(255)
-            thresh.Update()
-            alpha_processed = thresh.GetOutput()
-
-        # Extract RGB
+        thresh = vtk.vtkImageThreshold()
+        thresh.SetInputData(alpha)
+        thresh.ThresholdByUpper(128)
+        thresh.ReplaceInOn();  thresh.SetInValue(0)
+        thresh.ReplaceOutOn(); thresh.SetOutValue(255)
+        thresh.Update()
+        alpha_processed = thresh.GetOutput()
         rgb_extract = vtk.vtkImageExtractComponents()
         rgb_extract.SetInputData(img)
         rgb_extract.SetComponents(0,1,2)
         rgb_extract.Update()
-
         append = vtk.vtkImageAppendComponents()
         append.AddInputConnection(rgb_extract.GetOutputPort())
         append.AddInputData(alpha_processed)
@@ -404,22 +472,29 @@ class ViewerApp(QMainWindow):
         acts = self.renderer.GetActors(); acts.InitTraversal()
         for _ in range(acts.GetNumberOfItems()):
             a = acts.GetNextActor()
-            if not a: continue
+            if not a: 
+                continue
             p = a.GetProperty()
             if enabled:
                 # Store previous (ambient,diffuse)
                 if not hasattr(a, "_old_lighting"):
                     a._old_lighting = (p.GetAmbient(), p.GetDiffuse(), p.GetSpecular())
-                p.SetAmbient(1.0); p.SetDiffuse(0.0); p.SetSpecular(0.0)
-                if hasattr(p, "LightingOff"): p.LightingOff()
+                p.SetAmbient(1.0)
+                p.SetDiffuse(0.0)
+                p.SetSpecular(0.0)
+                if hasattr(p, "LightingOff"):
+                    p.LightingOff()
                 tex = a.GetTexture()
                 if tex and hasattr(vtk.vtkTexture,"VTK_TEXTURE_BLENDING_MODE_REPLACE") and hasattr(tex,"SetBlendingMode"):
                     tex.SetBlendingMode(vtk.vtkTexture.VTK_TEXTURE_BLENDING_MODE_REPLACE)
             else:
                 if hasattr(a, "_old_lighting"):
                     amb,dif,spec = a._old_lighting
-                    p.SetAmbient(amb); p.SetDiffuse(dif); p.SetSpecular(spec)
-                if hasattr(p, "LightingOn"): p.LightingOn()
+                    p.SetAmbient(amb)
+                    p.SetDiffuse(dif)
+                    p.SetSpecular(spec)
+                if hasattr(p, "LightingOn"): 
+                    p.LightingOn()
         self.statusBar().showMessage(f"Unlit: {'ON' if enabled else 'OFF'}")
         self.ren_win.Render()
 
@@ -429,7 +504,8 @@ class ViewerApp(QMainWindow):
         acts = self.renderer.GetActors(); acts.InitTraversal()
         for _ in range(acts.GetNumberOfItems()):
             a = acts.GetNextActor()
-            if not a: continue
+            if not a:
+                continue
             p = a.GetProperty()
             if self.unlit:
                 p.SetAmbient(min(1.0, 1.0 * factor))
@@ -466,21 +542,21 @@ class ViewerApp(QMainWindow):
         ''' Load a 3D model from file. '''
         self.renderer.RemoveAllViewProps()
         self._shared_texture = None  # reset cached texture
+        self._texture_cache.clear()
+        self._actor_material.clear()
         self.model_transform.Identity()  # reset model transform
         self.current_file = filename
         ext = os.path.splitext(filename)[1].lower()
 
         try:
-            '''
-            if ext == ".obj":
-                self._load_obj(filename)
-                
-            '''
             if ext == ".obj":
                 actors = self._load_obj_manual(filename)
                 for a in actors:
                     self.renderer.AddActor(a)
-                self._apply_manual_atlas(filename, os.path.splitext(filename)[0] + ".mtl")
+                # Try per-material textures from MTL; fallback to manual atlas if none found
+                mtl_path = os.path.splitext(filename)[0] + ".mtl"
+                if not self._apply_textures_from_mtl(filename, mtl_path):
+                    self._apply_manual_atlas(filename, mtl_path)
 
             elif ext in (".stl", ".ply"):
                 self._load_mesh_simple(filename)
@@ -515,6 +591,21 @@ class ViewerApp(QMainWindow):
         return img
 
 
+    def _extract_mtl_map(self, tokens):
+        """Pick the actual filename from a map_* line (skip options like -o, -s, -bm)."""
+        if not tokens:
+            return None
+        # Known image extensions VTK can read out of the box
+        exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".tga")
+        # Scan from the end; choose the first token that looks like a file
+        for tok in reversed(tokens):
+            t = tok.strip().strip('"')
+            if "." in t and t.lower().endswith(exts):
+                return t
+        # Fallback: last token
+        return tokens[-1].strip().strip('"')
+
+
     def _compose_rgba(self, rgb_img, alpha_img):
         ''' Combine RGB image and Alpha image into RGBA image.'''
         if not (rgb_img and alpha_img): return rgb_img
@@ -535,16 +626,30 @@ class ViewerApp(QMainWindow):
         append.Update()
         return append.GetOutput()
 
+
     def _apply_manual_atlas(self, obj_path: str, mtl_path: str):
-        ''' Apply a manual texture atlas based on known image files.'''
+        ''' Apply a manual texture atlas named after the model: <name>-RGB(A).png, <name>-Alpha.png. '''
         base_dir = os.path.dirname(obj_path)
-        rgb_path   = os.path.join(base_dir, "house-RGB.png")
-        rgba_path  = os.path.join(base_dir, "house-RGBA.png")
-        alpha_path = os.path.join(base_dir, "house-Alpha.png")
+        base_name = os.path.splitext(os.path.basename(obj_path))[0]
+
+        # Prefer model-specific atlas filenames
+        rgb_path   = os.path.join(base_dir, f"{base_name}-RGB.png")
+        rgba_path  = os.path.join(base_dir, f"{base_name}-RGBA.png")
+        alpha_path = os.path.join(base_dir, f"{base_name}-Alpha.png")
 
         rgba_img = self._load_png(rgba_path)
         rgb_img  = self._load_png(rgb_path)
         alpha_img= self._load_png(alpha_path)
+
+        # Optional: keep legacy "house-*.png" ONLY if the model is actually "house"
+        if not (rgba_img or rgb_img):
+            if base_name.lower() == "house":
+                rgb_path   = os.path.join(base_dir, "house-RGB.png")
+                rgba_path  = os.path.join(base_dir, "house-RGBA.png")
+                alpha_path = os.path.join(base_dir, "house-Alpha.png")
+                rgba_img = self._load_png(rgba_path)
+                rgb_img  = self._load_png(rgb_path)
+                alpha_img= self._load_png(alpha_path)
 
         if not rgba_img:
             if rgb_img and alpha_img:
@@ -552,13 +657,11 @@ class ViewerApp(QMainWindow):
             elif rgb_img:
                 rgba_img = rgb_img
             else:
-                print("[TEX] No atlas images found.")
+                print(f"[TEX] No atlas images found for '{base_name}'. Skipping atlas fallback.")
                 return
 
-        # Apply alpha mode (opaque/cutout/blend)
         rgba_img = self._process_alpha(rgba_img)
 
-        # Shared texture cache
         if self._shared_texture is None:
             tex = vtk.vtkTexture()
             tex.SetInputData(rgba_img)
@@ -569,16 +672,16 @@ class ViewerApp(QMainWindow):
                 except: pass
             self._shared_texture = tex
         tex = self._shared_texture
-        try:
-            tex.InterpolateOn()
-        except:
-            pass
+        try: tex.InterpolateOn()
+        except: pass
 
         acts = self.renderer.GetActors(); acts.InitTraversal()
         replaced = 0
         for _ in range(acts.GetNumberOfItems()):
             a = acts.GetNextActor()
             if not a: continue
+            if a.GetTexture():  # don't override MTL-applied textures
+                continue
             a.SetTexture(tex)
             replaced += 1
             p = a.GetProperty()
@@ -589,10 +692,9 @@ class ViewerApp(QMainWindow):
                 p.SetAmbient(0.50); p.SetDiffuse(0.85); p.SetSpecular(0.05)
             if self.transparency_mode != "blend":
                 p.SetOpacity(1.0)
-        
-        self.apply_brightness()
 
-        print(f"[TEX] Atlas applied (shared) to {replaced} actors.")
+        self.apply_brightness()
+        print(f"[TEX] Atlas applied to {replaced} actors using prefix '{base_name}-*.png'.")
         self.ren_win.Render()
 
 
@@ -637,6 +739,10 @@ class ViewerApp(QMainWindow):
         a.SetMapper(m)
         a.GetProperty().SetColor(0.85, 0.85, 0.9)
         a.GetProperty().SetAmbient(0.2); a.GetProperty().SetDiffuse(0.8)
+        try:
+            a.GetProperty().BackfaceCullingOn()
+        except:
+            pass
         self.renderer.AddActor(a)
 
     # ---------- Appearance ----------
@@ -768,7 +874,6 @@ class ViewerApp(QMainWindow):
             else:
                 mapper.SetInputData(poly)
 
-            mapper.SetInputData(poly)
             mapper.ScalarVisibilityOff()
             actor = vtk.vtkActor()
             actor.SetMapper(mapper)
@@ -777,6 +882,8 @@ class ViewerApp(QMainWindow):
             prop.SetAmbient(0.4)
             prop.SetDiffuse(0.6)
             actors.append(actor)
+            # Track material for this actor
+            self._actor_material[actor] = mat_name
 
         print(f"[OBJ-MANUAL] verts={len(verts)} uvs={len(uvs)} materials={len(mat_faces)} actors={len(actors)}")
         return actors
@@ -793,6 +900,142 @@ class ViewerApp(QMainWindow):
             else:
                 p.SetRepresentationToSurface()
         self.ren_win.Render()
+
+
+    def _load_image(self, path: str):
+        '''Load an image (png/jpg/jpeg/bmp/tif/tiff/tga) as vtkImageData; returns None if failed.'''
+        if not path:
+            return None
+        # Normalize and check existence (VTK readers can handle absolute/relative)
+        path = os.path.normpath(path)
+        if not os.path.isabs(path) and self.current_file:
+            base_dir = os.path.dirname(self.current_file)
+            path = os.path.normpath(os.path.join(base_dir, path))
+        if not os.path.isfile(path):
+            return None
+        # Try factory (covers PNG, JPEG, BMP, TIFF, TGA, etc.)
+        try:
+            factory = vtk.vtkImageReader2Factory()
+            reader = factory.CreateImageReader2(path)
+        except Exception:
+            reader = None
+        if reader is None:
+            # Fallback by extension
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".png":
+                reader = vtk.vtkPNGReader()
+            elif ext in (".jpg", ".jpeg"):
+                reader = vtk.vtkJPEGReader()
+            elif ext == ".bmp":
+                reader = vtk.vtkBMPReader()
+            elif ext in (".tif", ".tiff"):
+                reader = vtk.vtkTIFFReader()
+            elif ext == ".tga":
+                reader = vtk.vtkImageReader2()  # generic (may need factory)
+            else:
+                return None
+        reader.SetFileName(path)
+        try:
+            reader.Update()
+        except Exception:
+            return None
+        img = reader.GetOutput()
+        return img if img and img.GetDimensions() != (0,0,0) else None
+
+    def _parse_mtl(self, mtl_path: str):
+        '''Parse minimal MTL: returns dict name -> {map_Kd, map_d, Ka, Kd}.'''
+        mats = {}
+        if not os.path.isfile(mtl_path):
+            return mats
+        cur = None
+        with open(mtl_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                ls = line.strip().split()
+                if not ls: continue
+                tag = ls[0].lower()
+                if tag == "newmtl" and len(ls) >= 2:
+                    cur = ls[1]
+                    mats[cur] = {}
+                elif cur:
+                    if tag == "map_kd" and len(ls) >= 2:
+                        mats[cur]["map_Kd"] = self._extract_mtl_map(ls[1:])
+                    elif tag in ("map_d", "map_tr") and len(ls) >= 2:
+                        mats[cur]["map_d"] = self._extract_mtl_map(ls[1:])
+                    elif tag == "kd" and len(ls) >= 4:
+                        mats[cur]["Kd"] = tuple(map(float, ls[1:4]))
+                    elif tag == "ka" and len(ls) >= 4:
+                        mats[cur]["Ka"] = tuple(map(float, ls[1:4]))
+        return mats
+
+    def _apply_textures_from_mtl(self, obj_path: str, mtl_path: str) -> bool:
+        '''Apply textures per material from MTL. Returns True if any texture applied.'''
+        mats = self._parse_mtl(mtl_path)
+        if not mats:
+            return False
+        base_dir = os.path.dirname(obj_path)
+        any_applied = False
+
+        def norm_path(p):
+            if not p: return None
+            p = p.strip().strip('"')
+            return os.path.normpath(p if os.path.isabs(p) else os.path.join(base_dir, p))
+
+        # Image->texture cache (per alpha mode)
+        def get_texture(img_path: Optional[str], alpha_path: Optional[str]):
+            img_full = norm_path(img_path) if img_path else None
+            a_full = norm_path(alpha_path) if alpha_path else None
+            key = (img_full, a_full, self.transparency_mode)
+            if key in self._texture_cache:
+                return self._texture_cache[key]
+            rgb = self._load_image(img_full) if img_full else None
+            if not rgb:
+                return None
+            rgba = rgb
+            if a_full:
+                aimg = self._load_image(a_full)
+                if aimg:
+                    rgba = self._compose_rgba(rgb, aimg)
+            rgba = self._process_alpha(rgba)
+            tex = vtk.vtkTexture()
+            tex.SetInputData(rgba)
+            try: tex.EdgeClampOn()
+            except: pass
+            if hasattr(tex, "SetUseSRGBColorSpace"):
+                try: tex.SetUseSRGBColorSpace(True)
+                except: pass
+            try: tex.InterpolateOn()
+            except: pass
+            self._texture_cache[key] = tex
+            return tex
+
+        acts = self.renderer.GetActors(); acts.InitTraversal()
+        for _ in range(acts.GetNumberOfItems()):
+            a = acts.GetNextActor()
+            if not a: continue
+            mat = self._actor_material.get(a)
+            info = mats.get(mat) if mat else None
+            if not info: continue
+            map_kd = info.get("map_Kd")
+            map_d  = info.get("map_d")
+            tex = get_texture(map_kd, map_d)
+            if tex:
+                a.SetTexture(tex)
+                any_applied = True
+                p = a.GetProperty()
+                if "Kd" in info:
+                    p.SetDiffuseColor(*info["Kd"])
+                if self.unlit:
+                    p.SetAmbient(1.0); p.SetDiffuse(0.0); p.SetSpecular(0.0)
+                else:
+                    p.SetAmbient(0.50); p.SetDiffuse(0.85); p.SetSpecular(0.05)
+                if self.transparency_mode != "blend":
+                    p.SetOpacity(1.0)
+
+        if any_applied:
+            self.apply_brightness()
+            self.ren_win.Render()
+        return any_applied
+
 
     def cycle_background(self):
         ''' Cycle through predefined background colors. '''
@@ -897,6 +1140,8 @@ class ViewerApp(QMainWindow):
             return
         style = cls()
         style.SetDefaultRenderer(self.renderer)
+        if hasattr(style, "SetCurrentRenderer"):
+            style.SetCurrentRenderer(self.renderer)
         self.iren.SetInteractorStyle(style)
         self._interactor_style = style  # keep reference alive
         self.mouse_style = style_name
