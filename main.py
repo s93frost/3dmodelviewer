@@ -1,6 +1,6 @@
 import sys
 from PyQt5.QtWidgets import QApplication
-from minimal_viewer import ViewerApp
+from viewer import ViewerApp
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

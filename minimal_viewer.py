@@ -27,6 +27,8 @@ class ViewerApp(QMainWindow):
         self.unlit = False
         self._shared_texture = None
         self.transparency_mode = "opaque"  # opaque | cutout | blend
+        # Transform applied to the whole model (all actors)
+        self.model_transform = vtk.vtkTransform()
 
         # Central VTK widget
         from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
@@ -46,6 +48,12 @@ class ViewerApp(QMainWindow):
         self.ren_win.AddRenderer(self.renderer)
         self.iren = self.vtk_widget.GetRenderWindow().GetInteractor()
         self.vtk_widget.Initialize()
+
+         # Mouse styles
+        self.mouse_styles = ["trackball", "terrain", "joystick"]
+        self.mouse_style = "trackball"
+        self._interactor_style = None
+        self.set_mouse_style(self.mouse_style)
 
         try:
             self.ren_win.SetAlphaBitPlanes(1)
@@ -191,9 +199,14 @@ class ViewerApp(QMainWindow):
         mb = self.menuBar()
 
         fmenu = mb.addMenu("File")
-        act_open = QAction("Open...", self)
+        act_open = QAction("Open Model", self)
         act_open.triggered.connect(self.open_file)
         fmenu.addAction(act_open)
+
+        act_save = QAction("Save Model As...", self)
+        act_save.setShortcut("Ctrl+Shift+S")
+        act_save.triggered.connect(self.save_model_as)
+        fmenu.addAction(act_save)
 
         vmenu = mb.addMenu("View")
         act_reset = QAction("Reset View", self)
@@ -214,6 +227,17 @@ class ViewerApp(QMainWindow):
         act_wire.setShortcut("W")
         act_wire.triggered.connect(self.toggle_wireframe)
         vmenu.addAction(act_wire)
+
+        # Mouse menu
+        mmenu = mb.addMenu("Mouse")
+        mgroup = QActionGroup(self); mgroup.setExclusive(True)
+        for name, label in (("trackball","Trackball"), ("terrain","Terrain"), ("joystick","Joystick")):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(self.mouse_style == name)
+            act.triggered.connect(lambda checked, n=name: checked and self.set_mouse_style(n))
+            mgroup.addAction(act)
+            mmenu.addAction(act)
 
         # Transparency menu
         tmenu = mb.addMenu("Transparency")
@@ -267,6 +291,28 @@ class ViewerApp(QMainWindow):
     def _on_key(self, obj, evt):
         ''' Handle keypress events for debugging. '''
         key = self.iren.GetKeySym().lower()
+
+        # Zoom: + / - (also '=' and '_' and keypad variants)
+        if key in ('plus','equal','kp_add','minus','underscore','kp_subtract'):
+            fast = bool(self.iren.GetShiftKey())
+            direction = +1 if key in ('plus','equal','kp_add') else -1
+            self.zoom(direction, fast=fast)
+            return
+
+        # Movement step (Shift = x5)
+        if key in ('left','right','up','down','page_up','page_down'):
+            fast = bool(self.iren.GetShiftKey())
+            step = self._move_step(fast=fast)
+            dx = dy = dz = 0.0
+            if key == 'left':  dx = -step
+            if key == 'right': dx = +step
+            if key == 'up':    dy = +step
+            if key == 'down':  dy = -step
+            if key == 'page_up':   dz = +step
+            if key == 'page_down': dz = -step
+            self.nudge_model(dx, dy, dz)
+            return
+
         if key == 't':
             self.dump_actor_textures()
         elif key == 'f':
@@ -275,6 +321,31 @@ class ViewerApp(QMainWindow):
             self.reapply_texture_fix()
         elif key == 'd':
             self.diagnose_textures()
+
+    def save_model_as(self):
+        # Export current scene to Wavefront OBJ (+ MTL + textures)
+        if not self.renderer or self.renderer.GetActors().GetNumberOfItems() == 0:
+            self.statusBar().showMessage("Nothing to save")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Model As", "",
+            "Wavefront OBJ (*.obj)"
+        )
+        if not path:
+            return
+        # Ensure .obj extension
+        if not path.lower().endswith(".obj"):
+            path += ".obj"
+        prefix = os.path.splitext(path)[0]
+        try:
+            exp = vtk.vtkOBJExporter()
+            exp.SetRenderWindow(self.ren_win)
+            exp.SetFilePrefix(prefix)
+            exp.Write()
+            self.statusBar().showMessage(f"Saved: {os.path.basename(path)}")
+        except Exception as e:
+            self.statusBar().showMessage(f"Save failed: {e}")
+            print("Save error:", e)
 
     def _bind_debug_keys(self):
         ''' Bind debug key events. '''
@@ -395,6 +466,7 @@ class ViewerApp(QMainWindow):
         ''' Load a 3D model from file. '''
         self.renderer.RemoveAllViewProps()
         self._shared_texture = None  # reset cached texture
+        self.model_transform.Identity()  # reset model transform
         self.current_file = filename
         ext = os.path.splitext(filename)[1].lower()
 
@@ -415,7 +487,11 @@ class ViewerApp(QMainWindow):
             else:
                 self.statusBar().showMessage(f"Unsupported: {ext}")
                 return
+
+            # Attach transform to all actors and reset view
+            self._attach_model_transform()
             self.reset_view()
+
             self.update_info()
             self.statusBar().showMessage(f"Loaded: {os.path.basename(filename)}")
         except Exception as e:
@@ -519,86 +595,6 @@ class ViewerApp(QMainWindow):
         print(f"[TEX] Atlas applied (shared) to {replaced} actors.")
         self.ren_win.Render()
 
-    '''
-    def _load_obj(self, obj_path: str):
-        """Try vtkOBJImporter; if UVs degenerate, fallback to manual parser with proper TCoords."""
-        mtl_path = os.path.splitext(obj_path)[0] + ".mtl"
-        used_importer = True
-        failed_uv = False
-
-        # 1) Try importer
-        imp = vtk.vtkOBJImporter()
-        imp.SetFileName(obj_path)
-        if os.path.isfile(mtl_path):
-            imp.SetFileNameMTL(mtl_path)
-        imp.SetTexturePath(os.path.dirname(obj_path))
-        imp.SetRenderWindow(self.ren_win)
-        try:
-            imp.Update()
-        except Exception as e:
-            print("[OBJ] Importer failed:", e)
-            used_importer = False
-
-        if used_importer:
-            # Move actors (same as before)
-            rens = self.ren_win.GetRenderers(); rens.InitTraversal()
-            extra = []
-            for _ in range(rens.GetNumberOfItems()):
-                ren = rens.GetNextItem()
-                if ren is not self.renderer:
-                    extra.append(ren)
-            for er in extra:
-                acts = er.GetActors(); acts.InitTraversal()
-                for _ in range(acts.GetNumberOfItems()):
-                    a = acts.GetNextActor()
-                    if a: self.renderer.AddActor(a)
-                self.ren_win.RemoveRenderer(er)
-
-            # Check UV quality (sample first actor)
-            acts = self.renderer.GetActors(); acts.InitTraversal()
-            sample_actor = acts.GetNextActor()
-            if sample_actor:
-                m = sample_actor.GetMapper()
-                pd = m.GetInput() if m else None
-                if pd and pd.GetPointData() and pd.GetPointData().GetTCoords():
-                    tc = pd.GetPointData().GetTCoords()
-                    if tc.GetNumberOfTuples() == 0:
-                        failed_uv = True
-                    else:
-                        # If first 50 tuples all (0,0) treat as failed
-                        limit = min(50, tc.GetNumberOfTuples())
-                        all_zero = True
-                        for i in range(limit):
-                            u,v = tc.GetTuple(i)[:2]
-                            if abs(u) > 1e-6 or abs(v) > 1e-6:
-                                all_zero = False
-                                break
-                        failed_uv = all_zero
-                else:
-                    failed_uv = True
-            else:
-                failed_uv = True
-
-        if (not used_importer) or failed_uv:
-            print("[OBJ] Falling back to manual OBJ loader (UV rebuild).")
-            self.renderer.RemoveAllViewProps()
-            actors = self._load_obj_manual(obj_path)
-            for a in actors:
-                self.renderer.AddActor(a)
-            # Manual texture atlas
-            self._apply_manual_atlas(obj_path, mtl_path)
-            self.apply_brightness()
-
-        # Camera & lighting baseline
-        self.renderer.ResetCamera()
-        self.renderer.ResetCameraClippingRange()
-        cam = self.renderer.GetActiveCamera()
-        b = self.renderer.ComputeVisiblePropBounds()
-        if not all(v == 0 for v in b):
-            cx=(b[0]+b[1])/2; cy=(b[2]+b[3])/2; cz=(b[4]+b[5])/2
-            cam.SetFocalPoint(cx,cy,cz)
-        self.ren_win.Render()
-        '''
 
     def _load_mesh_simple(self, path: str):
         ''' Load STL or PLY using trimesh if available, else VTK reader. '''
@@ -843,6 +839,68 @@ class ViewerApp(QMainWindow):
         self.renderer.ResetCameraClippingRange()
         self.ren_win.Render()
 
+
+    # ---------- Model movement ----------
+    def _attach_model_transform(self):
+        '''Attach the shared transform to all current actors.'''
+        acts = self.renderer.GetActors(); acts.InitTraversal()
+        for _ in range(acts.GetNumberOfItems()):
+            a = acts.GetNextActor()
+            if not a: continue
+            a.SetUserTransform(self.model_transform)
+
+    def _move_step(self, fast: bool = False) -> float:
+        '''Compute movement step from scene bounds.'''
+        b = self.renderer.ComputeVisiblePropBounds()
+        if not b or all(v == 0 for v in b):
+            base = 1.0
+        else:
+            span = max(b[1]-b[0], b[3]-b[2], b[5]-b[4])
+            base = max(1e-3, 0.02 * span)  # 2% of scene size
+        return base * (5.0 if fast else 1.0)
+
+    def nudge_model(self, dx: float, dy: float, dz: float):
+        '''Translate the whole model by (dx,dy,dz) in world space.'''
+        self.model_transform.PostMultiply()
+        self.model_transform.Translate(dx, dy, dz)
+        self.model_transform.Modified()
+        self.ren_win.Render()
+
+    # ---------- Zoom ----------
+    def zoom(self, direction: int, fast: bool = False):
+        '''Zoom camera: direction +1=in, -1=out. Shift (fast) makes it stronger.'''
+        cam = self.renderer.GetActiveCamera()
+        if not cam:
+            return
+        step = 1.2 if fast else 1.08
+        factor = step if direction > 0 else 1.0/step
+        if cam.GetParallelProjection():
+            # Parallel: adjust scale directly
+            scale = cam.GetParallelScale()
+            cam.SetParallelScale(scale / factor)
+        else:
+            # Perspective: dolly around focal point
+            cam.Dolly(factor)
+        self.renderer.ResetCameraClippingRange()
+        self.ren_win.Render()
+
+    # ---------- Mouse style ----------
+    def set_mouse_style(self, style_name: str):
+        style_name = (style_name or "").lower()
+        styles = {
+            "trackball": vtk.vtkInteractorStyleTrackballCamera,
+            "terrain": vtk.vtkInteractorStyleTerrain,
+            "joystick": vtk.vtkInteractorStyleJoystickCamera,
+        }
+        cls = styles.get(style_name)
+        if not cls:
+            return
+        style = cls()
+        style.SetDefaultRenderer(self.renderer)
+        self.iren.SetInteractorStyle(style)
+        self._interactor_style = style  # keep reference alive
+        self.mouse_style = style_name
+        self.statusBar().showMessage(f"Mouse: {style_name}")
 
     # ---------- Info ----------
     def update_info(self):
