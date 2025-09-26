@@ -28,6 +28,7 @@ class ViewerApp(QMainWindow):
         self.resize(1000, 700)
         self.unlit = False
         self._shared_texture = None
+        self.transparency_mode = "opaque"  # opaque | cutout | blend
         # Transform applied to the whole model (all actors)
         self.model_transform = vtk.vtkTransform()
         # Per-actor material and texture cache
@@ -88,8 +89,7 @@ class ViewerApp(QMainWindow):
         if os.path.isfile(default_obj):
             self.load_model(default_obj)
 
-        # Key events (movement + zoom)
-        self.iren.AddObserver("KeyPressEvent", self._on_key)
+        self._bind_debug_keys()
 
 
     def _init_toolbar(self):
@@ -150,18 +150,120 @@ class ViewerApp(QMainWindow):
         self.act_unlit.setToolTip("Toggle unlit (fullbright) textures")
         tb.addAction(self.act_unlit)
 
-    
-    def _strip_alpha(self, img: vtk.vtkImageData):
-        """Return image without alpha channel (RGB only)."""
-        if not img:
-            return img
-        if img.GetNumberOfScalarComponents() != 4:
-            return img
-        extract = vtk.vtkImageExtractComponents()
-        extract.SetInputData(img)
-        extract.SetComponents(0,1,2)
-        extract.Update()
-        return extract.GetOutput()
+
+    def dump_actor_textures(self):
+        ''' Debug: print info about actors, textures, properties'''
+        acts = self.renderer.GetActors(); acts.InitTraversal()
+        i=0
+        while i < acts.GetNumberOfItems():
+            a = acts.GetNextActor()
+            if a:
+                m = a.GetMapper()
+                tex = a.GetTexture()
+                p = a.GetProperty()
+                sv = m.GetScalarVisibility() if m else None
+                col = p.GetColor()
+                print(f"[ACT]{i} tex={bool(tex)} scalarVis={sv} color={tuple(round(c,3) for c in col)} amb={round(p.GetAmbient(),3)} diff={round(p.GetDiffuse(),3)} lightOn={p.GetLighting() if hasattr(p,'GetLighting') else 'n/a'}")
+            i+=1
+
+
+    def set_transparency_mode(self, mode: str):
+        '''Set transparency mode: "opaque", "cutout", "blend".'''
+        if mode not in ("opaque","cutout","blend"):
+            return
+        if mode == self.transparency_mode:
+            return
+        self.transparency_mode = mode
+        print(f"[ALPHA] mode -> {mode}")
+        try:
+            if hasattr(self.renderer, "SetUseDepthPeeling"):
+                self.renderer.SetUseDepthPeeling(mode == "blend")
+        except:
+            pass
+        
+        # Invalidate caches and reapply textures
+        self._shared_texture = None
+        self._texture_cache.clear()
+        if self.current_file and self.current_file.lower().endswith(".obj"):
+            mtl_path = os.path.splitext(self.current_file)[0] + ".mtl"
+            if not self._apply_textures_from_mtl(self.current_file, mtl_path):
+                self._apply_manual_atlas(self.current_file, mtl_path)
+        self.ren_win.Render()
+
+
+    def diagnose_textures(self):
+        ''' Debug: check actors for UVs, texture formats, alpha channel'''
+        acts = self.renderer.GetActors(); acts.InitTraversal()
+        i = 0
+        for _ in range(acts.GetNumberOfItems()):
+            a = acts.GetNextActor()
+            if not a: continue
+            m = a.GetMapper()
+            pd = m.GetInput() if m else None
+            tcoords_ok = False
+            tcoord_range = None
+            if pd and pd.GetPointData():
+                tc = pd.GetPointData().GetTCoords()
+                if tc:
+                    tcoords_ok = True
+                    # sample first 3 tuples
+                    n = min(3, tc.GetNumberOfTuples())
+                    samples = []
+                    for k in range(n):
+                        u,v = tc.GetTuple(k)[:2]
+                        samples.append((round(u,4), round(v,4)))
+                    tcoord_range = samples
+            tex = a.GetTexture()
+            dims = None
+            comps = None
+            alpha_channel_nonzero = None
+            if tex and tex.GetInput():
+                img = tex.GetInput()
+                dims = img.GetDimensions()
+                comps = img.GetNumberOfScalarComponents()
+                if comps in (2,4):
+                    scalars = img.GetPointData().GetScalars()
+                    if scalars:
+                        # crude check: sample middle pixel alpha
+                        midx = dims[0]//2; midy = dims[1]//2
+                        # GetArray pointer: safer to use GetTuple
+                        alpha_val = scalars.GetTuple((midy * dims[0] + midx))[comps-1]
+                        alpha_channel_nonzero = alpha_val > 0
+                elif comps == 1:  # maybe we only have alpha
+                    alpha_channel_nonzero = True  # treat as mask
+            p = a.GetProperty()
+            print(f"[DIAG] A{i} UVs={tcoords_ok} UV_samples={tcoord_range} tex_dims={dims} comps={comps} alphaNonZero={alpha_channel_nonzero} amb={round(p.GetAmbient(),2)} diff={round(p.GetDiffuse(),2)} color={tuple(round(c,2) for c in p.GetColor())}")
+            i += 1
+            if i >= 5: break  # limit output
+
+
+    def force_fullbright(self):
+        ''' Debug: force all actors to fullbright (unlit)'''
+        acts = self.renderer.GetActors(); acts.InitTraversal()
+        for _ in range(acts.GetNumberOfItems()):
+            a = acts.GetNextActor()
+            if not a: continue
+            m = a.GetMapper()
+            if m: m.ScalarVisibilityOff()
+            tex = a.GetTexture()
+            p = a.GetProperty()
+            p.SetColor(1,1,1)
+            p.SetAmbient(1.0)
+            p.SetDiffuse(0.0)
+            p.SetSpecular(0.0)
+            if hasattr(p,"LightingOff"): p.LightingOff()
+            if tex:
+                try:
+                    if hasattr(vtk.vtkTexture,"VTK_TEXTURE_BLENDING_MODE_REPLACE") and hasattr(tex,"SetBlendingMode"):
+                        tex.SetBlendingMode(vtk.vtkTexture.VTK_TEXTURE_BLENDING_MODE_REPLACE)
+                except: pass
+        self.ren_win.Render()
+        print("[FIX] Forced fullbright applied.")
+
+    def reapply_texture_fix(self):
+        ''' Debug: reapply texture fix (remove textures from actors lacking UVs)'''
+        # Call after load if still dark
+        self.force_fullbright()
 
 
     # ---------- UI ----------
@@ -211,6 +313,19 @@ class ViewerApp(QMainWindow):
             mgroup.addAction(act)
             mmenu.addAction(act)
 
+        # Transparency menu
+        tmenu = mb.addMenu("Transparency")
+        group = QActionGroup(self); group.setExclusive(True)
+        for mode in ("opaque","cutout","blend"):
+            act = QAction(mode.capitalize(), self)
+            act.setCheckable(True)
+            act.setData(mode)
+            if mode == self.transparency_mode:
+                act.setChecked(True)
+            act.triggered.connect(lambda checked, m=mode: checked and self.set_transparency_mode(m))
+            group.addAction(act)
+            tmenu.addAction(act)
+
         # Brightness menu
         bmenu = mb.addMenu("Brightness")
         act_norm = QAction("Normal", self)
@@ -251,7 +366,7 @@ class ViewerApp(QMainWindow):
         imenu.addAction(act_refresh)
 
     def _on_key(self, obj, evt):
-        ''' Handle keypress events for zoom and movement. '''
+        ''' Handle keypress events for debugging. '''
         key = self.iren.GetKeySym().lower()
 
         # Zoom: + / - (also '=' and '_' and keypad variants)
@@ -275,6 +390,14 @@ class ViewerApp(QMainWindow):
             self.nudge_model(dx, dy, dz)
             return
 
+        if key == 't':
+            self.dump_actor_textures()
+        elif key == 'f':
+            self.force_fullbright()
+        elif key == 'r':
+            self.reapply_texture_fix()
+        elif key == 'd':
+            self.diagnose_textures()
 
     def save_model_as(self):
         ''' Export current scene to Wavefront OBJ (+ MTL + textures). '''
@@ -300,6 +423,47 @@ class ViewerApp(QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f"Save failed: {e}")
             print("Save error:", e)
+
+    def _bind_debug_keys(self):
+        ''' Bind debug key events. '''
+        self.iren.AddObserver("KeyPressEvent", self._on_key)
+
+
+    def _process_alpha(self, img: vtk.vtkImageData):
+        ''' Process image alpha channel according to transparency_mode.'''
+        if not img or img.GetNumberOfScalarComponents() < 4:
+            return img
+        mode = self.transparency_mode
+        if mode == "blend":
+            return img
+        if mode == "opaque":
+            rgb_extract = vtk.vtkImageExtractComponents()
+            rgb_extract.SetInputData(img)
+            rgb_extract.SetComponents(0,1,2)
+            rgb_extract.Update()
+            return rgb_extract.GetOutput()
+        # cutout: binary mask >128 -> 255 else 0
+        alpha_extract = vtk.vtkImageExtractComponents()
+        alpha_extract.SetInputData(img)
+        alpha_extract.SetComponents(3)
+        alpha_extract.Update()
+        alpha = alpha_extract.GetOutput()
+        thresh = vtk.vtkImageThreshold()
+        thresh.SetInputData(alpha)
+        thresh.ThresholdByUpper(128)
+        thresh.ReplaceInOn();  thresh.SetInValue(0)
+        thresh.ReplaceOutOn(); thresh.SetOutValue(255)
+        thresh.Update()
+        alpha_processed = thresh.GetOutput()
+        rgb_extract = vtk.vtkImageExtractComponents()
+        rgb_extract.SetInputData(img)
+        rgb_extract.SetComponents(0,1,2)
+        rgb_extract.Update()
+        append = vtk.vtkImageAppendComponents()
+        append.AddInputConnection(rgb_extract.GetOutputPort())
+        append.AddInputData(alpha_processed)
+        append.Update()
+        return append.GetOutput()
 
 
     def toggle_unlit(self, enabled: bool):
@@ -331,7 +495,6 @@ class ViewerApp(QMainWindow):
                     p.SetSpecular(spec)
                 if hasattr(p, "LightingOn"): 
                     p.LightingOn()
-                p.SetOpacity(1.0)
         self.statusBar().showMessage(f"Unlit: {'ON' if enabled else 'OFF'}")
         self.ren_win.Render()
 
@@ -497,8 +660,8 @@ class ViewerApp(QMainWindow):
                 print(f"[TEX] No atlas images found for '{base_name}'. Skipping atlas fallback.")
                 return
 
-        # Strip alpha so atlas is fully opaque
-        rgba_img = self._strip_alpha(rgba_img)
+        rgba_img = self._process_alpha(rgba_img)
+
         if self._shared_texture is None:
             tex = vtk.vtkTexture()
             tex.SetInputData(rgba_img)
@@ -509,15 +672,8 @@ class ViewerApp(QMainWindow):
                 except: pass
             self._shared_texture = tex
         tex = self._shared_texture
-        try:
-            tex.InterpolateOn()
-        except:
-            pass
-        if hasattr(tex, "SetUseAlpha"):
-            try:
-                tex.SetUseAlpha(False)
-            except:
-                pass
+        try: tex.InterpolateOn()
+        except: pass
 
         acts = self.renderer.GetActors(); acts.InitTraversal()
         replaced = 0
@@ -534,6 +690,8 @@ class ViewerApp(QMainWindow):
                 p.SetAmbient(1.0); p.SetDiffuse(0.0); p.SetSpecular(0.0)
             else:
                 p.SetAmbient(0.50); p.SetDiffuse(0.85); p.SetSpecular(0.05)
+            if self.transparency_mode != "blend":
+                p.SetOpacity(1.0)
         if replaced == 0:
             print(f"[TEX] Atlas fallback skipped (all actors already textured).")
 
@@ -828,41 +986,27 @@ class ViewerApp(QMainWindow):
         def get_texture(img_path: Optional[str], alpha_path: Optional[str]):
             img_full = norm_path(img_path) if img_path else None
             a_full = norm_path(alpha_path) if alpha_path else None
-            key = (img_full, a_full)
+            key = (img_full, a_full, self.transparency_mode)
             if key in self._texture_cache:
                 return self._texture_cache[key]
             rgb = self._load_image(img_full) if img_full else None
             if not rgb:
                 return None
-
             rgba = rgb
             if a_full:
                 aimg = self._load_image(a_full)
                 if aimg:
                     rgba = self._compose_rgba(rgb, aimg)
-            # Force opaque (strip alpha if present)
-            rgba = self._strip_alpha(rgba)
+            rgba = self._process_alpha(rgba)
             tex = vtk.vtkTexture()
             tex.SetInputData(rgba)
-            try:
-                tex.EdgeClampOn()
-            except:
-                pass
+            try: tex.EdgeClampOn()
+            except: pass
             if hasattr(tex, "SetUseSRGBColorSpace"):
-                try:
-                    tex.SetUseSRGBColorSpace(True)
-                except:
-                    pass
-            try:
-                tex.InterpolateOn()
-            except:
-                pass
-            # Disable alpha usage if API available
-            if hasattr(tex, "SetUseAlpha"):
-                try:
-                    tex.SetUseAlpha(False)
-                except:
-                    pass
+                try: tex.SetUseSRGBColorSpace(True)
+                except: pass
+            try: tex.InterpolateOn()
+            except: pass
             self._texture_cache[key] = tex
             return tex
 
@@ -878,8 +1022,6 @@ class ViewerApp(QMainWindow):
             tex = get_texture(map_kd, map_d)
             if tex:
                 a.SetTexture(tex)
-                # Ensure property fully opaque
-                a.GetProperty().SetOpacity(1.0)
                 any_applied = True
                 p = a.GetProperty()
                 if "Kd" in info:
@@ -888,6 +1030,8 @@ class ViewerApp(QMainWindow):
                     p.SetAmbient(1.0); p.SetDiffuse(0.0); p.SetSpecular(0.0)
                 else:
                     p.SetAmbient(0.50); p.SetDiffuse(0.85); p.SetSpecular(0.05)
+                if self.transparency_mode != "blend":
+                    p.SetOpacity(1.0)
 
         if any_applied:
             self.apply_brightness()
